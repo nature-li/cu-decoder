@@ -6,15 +6,24 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
 # 告诉编译器针对你的显卡架构进行优化
-# 例如：RTX 30系列是 86，RTX 40系列是 89
-# 如果不确定，可以设为 75 (T4/RTX 20) 或 80 (A100)
-set(CMAKE_CUDA_ARCHITECTURES 86)
+set(CMAKE_CUDA_ARCHITECTURES 100)
 
-# 添加可执行文件
-add_executable(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
+find_package(CUDAToolkit REQUIRED)
 
-# 如果你用到了数学库 (如 cublas)，需要链接它们
-# target_link_libraries(mini_gpt_basic_attention PRIVATE cublas)
+macro(add_cuda_target target source)
+    # 添加可执行文件
+    add_executable(${target} ${source})
 
-# 指定输出位置（可选）
-set_target_properties(mini_gpt_basic_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    # 链接库
+    target_link_libraries(${target} PRIVATE CUDA::cudart cublas)
+
+    # 统一输出路径到 build 根目录
+    set_target_properties(${target} PROPERTIES 
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
+
+    message(STATUS "Successfully added CUDA target: ${target}")
+endmacro()
+
+add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
+add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
