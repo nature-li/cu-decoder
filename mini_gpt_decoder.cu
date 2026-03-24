@@ -47,21 +47,21 @@ __global__ void add_bias_kernel(float* out, const float* bias, int n) {
 }
 
 /**
- * 高性能线性层 (Linear Layer) 实现
- * 计算 out = x @ weight + bias
+ * 高性能线性层 (Linear Layer) 实现 - PyTorch 标准对齐版
+ * 计算 C = X @ W.T + bias
  *
  * @param handle    cuBLAS 句柄
- * @param m         Batch Size (推理时通常为 1)
- * @param n         输出维度 (Output Features)
- * @param k         输入维度 (Input Features)
- * @param d_x       输入向量指针 (GPU)
- * @param d_w       权重矩阵指针 (GPU)
- * @param d_bias    偏置项指针 (GPU，如果 nullptr 则不加)
- * @param d_out     输出向量指针 (GPU)
+ * @param m         Batch Size (m)
+ * @param n         输出维度 (out_features)
+ * @param k         输入维度 (in_features)
+ * @param d_x       输入向量: [m, k] (行优先)
+ * @param d_w       权重矩阵: [n, k] (行优先, PyTorch 标准)
+ * @param d_bias    偏置项:   [n]
+ * @param d_out     输出向量: [m, n] (行优先)
  */
 void cublas_linear(cublasHandle_t handle, int m, int n, int k,
                    const float* d_x,     // [m, k]
-                   const float* d_w,     // [k, n]
+                   const float* d_w,     // [n, k]
                    const float* d_bias,  // [1, n]
                    float* d_out          // [m, n]
 ) {
@@ -82,21 +82,28 @@ void cublas_linear(cublasHandle_t handle, int m, int n, int k,
    * B_T: shape[n, k]
    *
    * C_T = B_T * A_T = [n, m]
+   *
+   * 目标(Row-Major): C[m, n] = X[m, k] @ W^T[k, n]
+   * cuBLAS(Col-Major): C_col[n, m] = W_col^T[n, k] @ X_col[k, m]
+   *
+   * W 在内存中是 [n, k] 行优先 -> W_col 是 [k, n] 列优先
+   * X 在内存中是 [m, k] 行优先 -> X_col 是 [k, m] 列优先
+   * 我们需要 W_col^T (变成 n x k) 去乘 X_col (k x m)
    */
   cublasSgemm(handle,       // cuBLAS 上下文句柄
-              CUBLAS_OP_N,  // 矩阵 A 是否转置
+              CUBLAS_OP_T,  // 矩阵 A 是否转置
               CUBLAS_OP_N,  // 矩阵 B 是否转置
-              n,            // 矩阵 A (op) 的行数，也是 C 的行数
-              m,            // 矩阵 B (op) 的列数，也是 C 的列数
-              k,            // A 的列数 / B 的行数（乘法公共维）
+              n,            // 结果矩阵 C_col 的行数 (out_features)
+              m,            // 结果矩阵 C_col 的列数 (batch_size)
+              k,            // 公共维度 (in_features)
               &alpha,       // 缩放系数 alpha (通常指向 1.0f)
-              d_w,          // 矩阵 A 的设备指针
-              n,      // A 的主维（Leading Dimension），列优先下通常是 A 的行数
-              d_x,    // 矩阵 B 的设备指针
-              k,      // B 的主维，列优先下通常是 B 的行数
-              &beta,  // 缩放系数 beta (通常指向 0.0f)
-              d_out,  // 矩阵 C 的设备指针
-              n);     // C 的主维，列优先下通常是 C 的行数
+              d_w,          // A 矩阵 (Weight)
+              k,            // lda: W_col 的行数，即 W 行优先时的列数 k
+              d_x,          // B 矩阵 (Input)
+              k,            // ldb: X_col 的行数，即 X 行优先时的列数 k
+              &beta,        // 缩放系数 beta (通常指向 0.0f)
+              d_out,        // C 矩阵 (Output)
+              n);           // ldc: C_col 的行数 n
 
   /**
    * cuBLAS 不支持 Bias，我们需要补一个简单的 kernel
@@ -105,6 +112,7 @@ void cublas_linear(cublasHandle_t handle, int m, int n, int k,
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     add_bias_kernel<<<blocks, threads>>>(d_out, d_bias, n);
+    CHECK_CUDA(cudaGetLastError());
   }
 }
 
@@ -273,6 +281,7 @@ void ffn_proj_kernel(cublasHandle_t handle, int batch, float* d_output,
 
     apply_relu_kernel<<<blocks_per_grid, threads_per_block>>>(d_output,
                                                               total_elements);
+    CHECK_CUDA(cudaGetLastError());
   }
 }
 
@@ -304,11 +313,13 @@ void gpt_forward(cublasHandle_t cb_handle, int current_id, int step,
   // Embedding
   embedding_kernel<<<(config.d_model + 255) / 256, 256>>>(
       d_x, current_id, d_emb, config.d_model);
+  CHECK_CUDA(cudaGetLastError());
 
   // 多层循环
   for (int l = 0; l < config.num_layers; l++) {
     // Attention
     rms_norm_kernel<<<1, 256>>>(d_tmp, d_x, d_rw1[l], config.d_model);
+    CHECK_CUDA(cudaGetLastError());
     /**
      * QKV 投影计算 (d_qkv = d_tmp @ W_qkv)
      * m = batch_size = 1
@@ -324,10 +335,13 @@ void gpt_forward(cublasHandle_t cb_handle, int current_id, int step,
                   nullptr,             // bias: 现代模型通常 QKV 不加 Bias
                   d_qkv);              // 输出: 存入 d_qkv buffer
 
-    split_qkv_kernel<<<1, 256>>>(d_qkv, d_q, d_kn, d_vn, config.d_model);
+    split_qkv_kernel<<<(config.d_model + 255) / 256, 256>>>(
+        d_qkv, d_q, d_kn, d_vn, config.d_model);
+    CHECK_CUDA(cudaGetLastError());
     update_cache_kernel<<<config.num_heads, config.head_dim>>>(
         d_kc[l], d_vc[l], d_kn, d_vn, step, config.num_heads, config.head_dim,
         config.max_seq_len);
+    CHECK_CUDA(cudaGetLastError());
 
     int attention_threads = 256;
     // 共享内存用来存 scores，最大 2048 个 float (8KB，完全没问题)
@@ -338,15 +352,18 @@ void gpt_forward(cublasHandle_t cb_handle, int current_id, int step,
     CHECK_CUDA(cudaGetLastError());
     residual_kernel<<<(config.d_model + 255) / 256, 256>>>(d_x, d_attn,
                                                            config.d_model);
+    CHECK_CUDA(cudaGetLastError());
 
     // FFN
     rms_norm_kernel<<<1, 256>>>(d_tmp, d_x, d_rw2[l], config.d_model);
+    CHECK_CUDA(cudaGetLastError());
     ffn_proj_kernel(cb_handle, 1, d_ffn_i, d_tmp, d_wup[l], config.d_model,
                     config.ffn_hidden, true);
     ffn_proj_kernel(cb_handle, 1, d_ffn_o, d_ffn_i, d_wdn[l], config.ffn_hidden,
                     config.d_model, false);
     residual_kernel<<<(config.d_model + 255) / 256, 256>>>(d_x, d_ffn_o,
                                                            config.d_model);
+    CHECK_CUDA(cudaGetLastError());
   }
 
   // Final RMSNorm
@@ -502,7 +519,7 @@ int main() {
   std::cout << "Starting Generation: " << vocab[current_id];
   std::vector<float> h_logits(config.vocab_size);
 
-  for (int step = 0; step < 30; step++) {
+  for (int step = 0; step < 1024; step++) {
     // 调用封装好的 forward
     gpt_forward(cb_handle, current_id, step, config, d_x, d_tmp, d_attn,
                 d_ffn_i, d_ffn_o, d_logits, d_qkv, d_q, d_kn, d_vn, d_emb,
