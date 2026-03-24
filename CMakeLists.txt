@@ -27,3 +27,4 @@ endmacro()
 
 add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
 add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
+add_cuda_target(mini_gpt_decoder_topk mini_gpt_decoder_topk.cu)

@@ -206,57 +206,11 @@ int sample_token(const std::vector<float>& logits, float temp) {
   return logits.size() - 1;
 }
 
-/**
- * Top-K 采样函数
- * @param k 取前 k 个最高分的词，通常设为 40 或 50
- */
-int sample_token_topk(const std::vector<float>& logits, float temp, int k,
-                      std::mt19937& gen) {
-  int vocab_size = logits.size();
-  // 确保 k 不超过词表大小
-  k = std::min(k, vocab_size);
-
-  // 1. 复制一份 logits 用来找阈值
-  std::vector<float> sorted_logits = logits;
-
-  // 2. 使用 nth_element 把前 k 大的数放到数组前面（不完全排序，效率高）
-  std::nth_element(sorted_logits.begin(), sorted_logits.begin() + k - 1,
-                   sorted_logits.end(), std::greater<float>());
-
-  // 第 k 个最大的值作为门槛
-  float threshold = sorted_logits[k - 1];
-
-  // 3. 计算 expf，只保留大于等于阈值的词
-  std::vector<float> p(vocab_size);
-  float max_logit = *std::max_element(logits.begin(), logits.end());
-  float sum = 0;
-
-  for (int i = 0; i < vocab_size; ++i) {
-    if (logits[i] >= threshold) {
-      p[i] = expf((logits[i] - max_logit) / temp);
-    } else {
-      p[i] = 0.0f;  // 被淘汰的词概率直接归零
-    }
-    sum += p[i];
-  }
-
-  // 4. 轮盘赌抽奖
-  std::uniform_real_distribution<float> dis(0.0f, 1.0f);
-  float r = dis(gen);
-  float cur = 0;
-  for (int i = 0; i < vocab_size; ++i) {
-    cur += p[i] / sum;
-    if (r <= cur) return i;
-  }
-  return vocab_size - 1;
-}
-
 // ============================================================================
 // 4. MAIN 函数
 // ============================================================================
 int main() {
-  std::mt19937 gen(time(NULL));
-
+  srand(time(0));
   std::vector<char> vocab;
   for (char c = 'a'; c <= 'z'; ++c) vocab.push_back(c);
   for (char c = 'A'; c <= 'Z'; ++c) vocab.push_back(c);
@@ -264,8 +218,6 @@ int main() {
 
   GPTConfig config = {62, 512, 8, 64, 2048, 1024, 12};
   int current_id = 0;
-  int top_k = 10;
-  float temperature = 0.8f;
 
   // 指针与分配
   float *d_x, *d_tmp, *d_attn, *d_ffn_i, *d_ffn_o, *d_logits, *d_qkv, *d_q,
@@ -333,7 +285,7 @@ int main() {
                           config.vocab_size * sizeof(float),
                           cudaMemcpyDeviceToHost));
 
-    current_id = sample_token_topk(h_logits, temperature, top_k, gen);
+    current_id = sample_token(h_logits, 1.2);  // 采样
     std::cout << vocab[current_id] << std::flush;
   }
 
