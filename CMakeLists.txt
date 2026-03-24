@@ -26,6 +26,4 @@ macro(add_cuda_target target source)
 endmacro()
 
 add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
-add_cuda_target(mini_gpt_decoder_v1 mini_gpt_decoder_v1.cu)
-add_cuda_target(mini_gpt_decoder_v2 mini_gpt_decoder_v2.cu)
 add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
