@@ -1,3 +1,4 @@
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -35,6 +36,81 @@ struct GPTConfig {
 // 2. 所有 Kernels (无省略)
 // ============================================================================
 
+/**
+ * out += bias
+ */
+__global__ void add_bias_kernel(float* out, const float* bias, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] += bias[i];
+  }
+}
+
+/**
+ * 高性能线性层 (Linear Layer) 实现
+ * 计算 out = x @ weight + bias
+ *
+ * @param handle    cuBLAS 句柄
+ * @param m         Batch Size (推理时通常为 1)
+ * @param n         输出维度 (Output Features)
+ * @param k         输入维度 (Input Features)
+ * @param d_x       输入向量指针 (GPU)
+ * @param d_w       权重矩阵指针 (GPU)
+ * @param d_bias    偏置项指针 (GPU，如果 nullptr 则不加)
+ * @param d_out     输出向量指针 (GPU)
+ */
+void cublas_linear(cublasHandle_t handle, int m, int n, int k,
+                   const float* d_x,     // [m, k]
+                   const float* d_w,     // [k, n]
+                   const float* d_bias,  // [1, n]
+                   float* d_out          // [m, n]
+) {
+  float alpha = 1.0f;
+  float beta = 0.0f;
+
+  /**
+   * C = A * B (在 cuBLAS 眼中)
+   * 推理时 x 是 (1, k), W 是 (k, n), out 是 (1, n)
+   * 因为 cuBLAS 是列优先，我们通过调换参数实现行优先计算
+   *
+   * 官方标准调用 (列优先计算 C[m,n] = A[m,k] * B[k,n])
+   * cublasSgemm(handle, transa, transb, m, n, k, ... A, lda, B, ldb, ... C,
+   * ldc);
+   *
+   * C_T: shape[n, m]
+   * A_T: shape[k, m]
+   * B_T: shape[n, k]
+   *
+   * C_T = B_T * A_T = [n, m]
+   */
+  cublasSgemm(handle,       // cuBLAS 上下文句柄
+              CUBLAS_OP_N,  // 矩阵 A 是否转置
+              CUBLAS_OP_N,  // 矩阵 B 是否转置
+              n,            // 矩阵 A (op) 的行数，也是 C 的行数
+              m,            // 矩阵 B (op) 的列数，也是 C 的列数
+              k,            // A 的列数 / B 的行数（乘法公共维）
+              &alpha,       // 缩放系数 alpha (通常指向 1.0f)
+              d_w,          // 矩阵 A 的设备指针
+              n,      // A 的主维（Leading Dimension），列优先下通常是 A 的行数
+              d_x,    // 矩阵 B 的设备指针
+              k,      // B 的主维，列优先下通常是 B 的行数
+              &beta,  // 缩放系数 beta (通常指向 0.0f)
+              d_out,  // 矩阵 C 的设备指针
+              n);     // C 的主维，列优先下通常是 C 的行数
+
+  /**
+   * cuBLAS 不支持 Bias，我们需要补一个简单的 kernel
+   */
+  if (d_bias != nullptr) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    add_bias_kernel<<<blocks, threads>>>(d_out, d_bias, n);
+  }
+}
+
+/**
+ * out = emb_table[token_id]
+ */
 __global__ void embedding_kernel(float* out, int token_id,
                                  const float* emb_table, int d_model) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -88,48 +164,116 @@ __global__ void attention_kernel(const float* q, const float* k_cache,
   int tid = threadIdx.x;
   float scale = 1.0f / sqrtf((float)head_dim);
   extern __shared__ float scores[];
-  if (tid <= step) {
+
+  /**
+   * 阶段 1：计算 Q @ K^T
+   * 使用跨步循环：256个线程一起上，如果 step > 256，线程会继续处理下一个批次的
+   * token
+   */
+  for (int i = tid; i <= step; i += blockDim.x) {
     float sum = 0.0f;
-    for (int d = 0; d < head_dim; d++)
+    for (int d = 0; d < head_dim; d++) {
       sum += q[head_idx * head_dim + d] *
-             k_cache[(head_idx * max_seq_len + tid) * head_dim + d];
-    scores[tid] = sum * scale;
+             k_cache[(head_idx * max_seq_len + i) * head_dim + d];
+    }
+    scores[i] = sum * scale;
   }
+
+  // 必须同步，等待所有线程把各自负责的 token 算完，填满 scores 数组
   __syncthreads();
+
+  /**
+   * 阶段 2：Softmax 计算
+   * 暂时保留用 0 号线程串行计算的逻辑。虽然慢一点，但在演示代码中能保证 100%
+   * 正确。 (后续如果要追求极致性能，这里可以替换为 Block 并行归约 Reduce)
+   */
   if (tid == 0) {
     float max_v = -1e20f;
-    for (int i = 0; i <= step; i++) max_v = fmaxf(max_v, scores[i]);
+    for (int i = 0; i <= step; i++) {
+      max_v = fmaxf(max_v, scores[i]);
+    }
+
     float exp_sum = 0.0f;
     for (int i = 0; i <= step; i++) {
       scores[i] = expf(scores[i] - max_v);
       exp_sum += scores[i];
     }
-    for (int i = 0; i <= step; i++) scores[i] /= exp_sum;
+
+    for (int i = 0; i <= step; i++) {
+      scores[i] /= exp_sum;
+    }
   }
+
+  // 必须同步，等待 0 号线程把归一化后的概率写回 scores
   __syncthreads();
-  if (tid < head_dim) {
+
+  /**
+   * 阶段 3：计算 Scores @ V
+   * 同样使用跨步循环来遍历特征维度 head_dim (通常是 64 或 128)
+   */
+  for (int d = tid; d < head_dim; d += blockDim.x) {
     float res = 0.0f;
-    for (int i = 0; i <= step; i++)
-      res += scores[i] * v_cache[(head_idx * max_seq_len + i) * head_dim + tid];
-    out[head_idx * head_dim + tid] = res;
+    for (int i = 0; i <= step; i++) {
+      res += scores[i] * v_cache[(head_idx * max_seq_len + i) * head_dim + d];
+    }
+    out[head_idx * head_dim + d] = res;
   }
 }
 
-__global__ void ffn_proj_kernel(float* out, const float* x, const float* weight,
-                                int in_dim, int out_dim, bool is_relu) {
-  int row = blockIdx.x;
-  int tid = threadIdx.x;
-  extern __shared__ float s_reduce[];
-  float sum = 0.0f;
-  for (int i = tid; i < in_dim; i += blockDim.x)
-    sum += x[i] * weight[row * in_dim + i];
-  s_reduce[tid] = sum;
-  __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) s_reduce[tid] += s_reduce[tid + s];
-    __syncthreads();
+__global__ void apply_relu_kernel(float* out, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < size) {
+    out[tid] = fmaxf(0.0f, out[tid]);
   }
-  if (tid == 0) out[row] = is_relu ? fmaxf(0.0f, s_reduce[0]) : s_reduce[0];
+}
+
+/**
+ * out = ReLU(x @ weight.T)
+ */
+void ffn_proj_kernel(cublasHandle_t handle, int batch, float* d_output,
+                     float* d_input, float* d_weight, int in_dim, int out_dim,
+                     bool is_relu) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  /**
+   * 行主序
+   * A = d_input
+   * B = d_weight
+   * C = A @ B.T
+   * A: [d_model] -> [batch][in_dim]
+   * B: [ffn_hidden, d_model] -> [out_dim][in_dim]
+   * B.T: [d_model, ffn_hidden] -> [in_dim][out_dim]
+   * C: [ffn_hidden] -> [batch][out_dim]
+   *
+   *
+   * 列主序
+   * C.T = B @ A.T
+   */
+  cublasSgemm(handle,
+              CUBLAS_OP_T,  // x @ weight -> weight @ x
+              CUBLAS_OP_N,  // 输入矩阵不转置
+              out_dim,      // op(A): [out_dim][in_dim]
+              batch,        // B: [in_dim][batch]
+              in_dim,       // in_dim
+              &alpha,
+              d_weight,  // <A>, shape: [in_dim][out_dim]
+              in_dim,
+              d_input,  // <B>, shape: [in_dim][batch]
+              in_dim, &beta,
+              d_output,  // C = output, shape: [out_dim][batch]
+              out_dim);
+
+  // 2. 如果需要 ReLU，启动一个简单的元素级 Kernel
+  if (is_relu) {
+    int total_elements = batch * out_dim;
+    int threads_per_block = 256;
+    int blocks_per_grid =
+        (total_elements + threads_per_block - 1) / threads_per_block;
+
+    apply_relu_kernel<<<blocks_per_grid, threads_per_block>>>(d_output,
+                                                              total_elements);
+  }
 }
 
 __global__ void residual_kernel(float* x, const float* delta, int d_model) {
@@ -150,12 +294,13 @@ void init_w(float* d_ptr, size_t size, int seed_offset) {
 }
 
 // 核心前向传播函数
-void gpt_forward(int current_id, int step, GPTConfig& config, float* d_x,
-                 float* d_tmp, float* d_attn, float* d_ffn_i, float* d_ffn_o,
-                 float* d_logits, float* d_qkv, float* d_q, float* d_kn,
-                 float* d_vn, float* d_emb, float* d_wlm, float** d_rw1,
-                 float** d_rw2, float** d_wup, float** d_wdn, float** d_kc,
-                 float** d_vc) {
+void gpt_forward(cublasHandle_t cb_handle, int current_id, int step,
+                 GPTConfig& config, float* d_x, float* d_tmp, float* d_attn,
+                 float* d_ffn_i, float* d_ffn_o, float* d_logits, float* d_qkv,
+                 float* d_q, float* d_kn, float* d_vn, float* d_emb,
+                 float* d_wlm, float** d_rw1, float** d_rw2, float** d_wup,
+                 float** d_wdn, float** d_wqkv, float** d_kc, float** d_vc,
+                 float* d_norm_f) {
   // Embedding
   embedding_kernel<<<(config.d_model + 255) / 256, 256>>>(
       d_x, current_id, d_emb, config.d_model);
@@ -164,31 +309,53 @@ void gpt_forward(int current_id, int step, GPTConfig& config, float* d_x,
   for (int l = 0; l < config.num_layers; l++) {
     // Attention
     rms_norm_kernel<<<1, 256>>>(d_tmp, d_x, d_rw1[l], config.d_model);
-    init_w(d_qkv, 3 * config.d_model, l * 10 + 1);  // 模拟投影
+    /**
+     * QKV 投影计算 (d_qkv = d_tmp @ W_qkv)
+     * m = batch_size = 1
+     * n = out_features = 3 * d_model
+     * k = in_features = d_model
+     */
+    cublas_linear(cb_handle,
+                  1,                   // m (batch)
+                  3 * config.d_model,  // n (out_dim)
+                  config.d_model,      // k (in_dim)
+                  d_tmp,               // 输入: d_tmp (RMSNorm 的输出)
+                  d_wqkv[l],           // 权重: 这一层的 QKV 权重
+                  nullptr,             // bias: 现代模型通常 QKV 不加 Bias
+                  d_qkv);              // 输出: 存入 d_qkv buffer
+
     split_qkv_kernel<<<1, 256>>>(d_qkv, d_q, d_kn, d_vn, config.d_model);
     update_cache_kernel<<<config.num_heads, config.head_dim>>>(
         d_kc[l], d_vc[l], d_kn, d_vn, step, config.num_heads, config.head_dim,
         config.max_seq_len);
-    attention_kernel<<<config.num_heads, config.max_seq_len,
-                       config.max_seq_len * sizeof(float)>>>(
+
+    int attention_threads = 256;
+    // 共享内存用来存 scores，最大 2048 个 float (8KB，完全没问题)
+    size_t shared_mem_size = config.max_seq_len * sizeof(float);
+    attention_kernel<<<config.num_heads, attention_threads, shared_mem_size>>>(
         d_q, d_kc[l], d_vc[l], d_attn, step, config.num_heads, config.head_dim,
         config.max_seq_len);
+    CHECK_CUDA(cudaGetLastError());
     residual_kernel<<<(config.d_model + 255) / 256, 256>>>(d_x, d_attn,
                                                            config.d_model);
 
     // FFN
     rms_norm_kernel<<<1, 256>>>(d_tmp, d_x, d_rw2[l], config.d_model);
-    ffn_proj_kernel<<<config.ffn_hidden, 256, 256 * sizeof(float)>>>(
-        d_ffn_i, d_tmp, d_wup[l], config.d_model, config.ffn_hidden, true);
-    ffn_proj_kernel<<<config.d_model, 256, 256 * sizeof(float)>>>(
-        d_ffn_o, d_ffn_i, d_wdn[l], config.ffn_hidden, config.d_model, false);
+    ffn_proj_kernel(cb_handle, 1, d_ffn_i, d_tmp, d_wup[l], config.d_model,
+                    config.ffn_hidden, true);
+    ffn_proj_kernel(cb_handle, 1, d_ffn_o, d_ffn_i, d_wdn[l], config.ffn_hidden,
+                    config.d_model, false);
     residual_kernel<<<(config.d_model + 255) / 256, 256>>>(d_x, d_ffn_o,
                                                            config.d_model);
   }
 
+  // Final RMSNorm
+  rms_norm_kernel<<<1, 256>>>(d_tmp, d_x, d_norm_f, config.d_model);
+  CHECK_CUDA(cudaGetLastError());
+
   // Output Logits
-  ffn_proj_kernel<<<config.vocab_size, 256, 256 * sizeof(float)>>>(
-      d_logits, d_x, d_wlm, config.d_model, config.vocab_size, false);
+  ffn_proj_kernel(cb_handle, 1, d_logits, d_tmp, d_wlm, config.d_model,
+                  config.vocab_size, false);
 }
 
 int sample_token(const std::vector<float>& logits, float temp) {
@@ -256,6 +423,7 @@ int sample_token_topk(const std::vector<float>& logits, float temp, int k,
 // ============================================================================
 int main() {
   std::mt19937 gen(time(NULL));
+  //   std::mt19937 gen(42);
 
   std::vector<char> vocab;
   for (char c = 'a'; c <= 'z'; ++c) vocab.push_back(c);
@@ -267,9 +435,13 @@ int main() {
   int top_k = 10;
   float temperature = 0.8f;
 
+  // 初始化 cuBLAS 句柄
+  cublasHandle_t cb_handle;
+  cublasCreate(&cb_handle);
+
   // 指针与分配
   float *d_x, *d_tmp, *d_attn, *d_ffn_i, *d_ffn_o, *d_logits, *d_qkv, *d_q,
-      *d_kn, *d_vn, *d_emb, *d_wlm;
+      *d_kn, *d_vn, *d_emb, *d_wlm, *d_norm_f;
   CHECK_CUDA(cudaMalloc(&d_x, config.d_model * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_tmp, config.d_model * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_attn, config.d_model * sizeof(float)));
@@ -284,14 +456,17 @@ int main() {
       cudaMalloc(&d_emb, config.vocab_size * config.d_model * sizeof(float)));
   CHECK_CUDA(
       cudaMalloc(&d_wlm, config.vocab_size * config.d_model * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_norm_f, config.d_model * sizeof(float)));
 
-  init_w(d_emb, config.vocab_size * config.d_model, 0);
-  init_w(d_wlm, config.vocab_size * config.d_model, 0);
+  init_w(d_emb, config.vocab_size * config.d_model, __LINE__);
+  init_w(d_wlm, config.vocab_size * config.d_model, __LINE__);
+  init_w(d_norm_f, config.d_model, __LINE__);
 
   float** d_rw1 = new float*[config.num_layers];
   float** d_rw2 = new float*[config.num_layers];
   float** d_wup = new float*[config.num_layers];
   float** d_wdn = new float*[config.num_layers];
+  float** d_wqkv = new float*[config.num_layers];
   float** d_kc = new float*[config.num_layers];
   float** d_vc = new float*[config.num_layers];
 
@@ -311,7 +486,11 @@ int main() {
                           config.d_model * config.ffn_hidden * sizeof(float)));
     init_w(d_wdn[l], config.d_model * config.ffn_hidden, l * 10 + 4);
 
-    // KV Cache 依然清零即可
+    CHECK_CUDA(cudaMalloc(&d_wqkv[l],
+                          config.d_model * 3 * config.d_model * sizeof(float)));
+    init_w(d_wqkv[l], config.d_model * 3 * config.d_model, l * 10 + 5);
+
+    // KV Cache 清零即可
     size_t c_sz =
         config.num_heads * config.max_seq_len * config.head_dim * sizeof(float);
     CHECK_CUDA(cudaMalloc(&d_kc[l], c_sz));
@@ -325,9 +504,10 @@ int main() {
 
   for (int step = 0; step < 30; step++) {
     // 调用封装好的 forward
-    gpt_forward(current_id, step, config, d_x, d_tmp, d_attn, d_ffn_i, d_ffn_o,
-                d_logits, d_qkv, d_q, d_kn, d_vn, d_emb, d_wlm, d_rw1, d_rw2,
-                d_wup, d_wdn, d_kc, d_vc);
+    gpt_forward(cb_handle, current_id, step, config, d_x, d_tmp, d_attn,
+                d_ffn_i, d_ffn_o, d_logits, d_qkv, d_q, d_kn, d_vn, d_emb,
+                d_wlm, d_rw1, d_rw2, d_wup, d_wdn, d_wqkv, d_kc, d_vc,
+                d_norm_f);
 
     CHECK_CUDA(cudaMemcpy(h_logits.data(), d_logits,
                           config.vocab_size * sizeof(float),
@@ -350,11 +530,13 @@ int main() {
   cudaFree(d_vn);
   cudaFree(d_emb);
   cudaFree(d_wlm);
+  cudaFree(d_norm_f);
   for (int l = 0; l < config.num_layers; l++) {
     cudaFree(d_rw1[l]);
     cudaFree(d_rw2[l]);
     cudaFree(d_wup[l]);
     cudaFree(d_wdn[l]);
+    cudaFree(d_wqkv[l]);
     cudaFree(d_kc[l]);
     cudaFree(d_vc[l]);
   }
@@ -362,8 +544,11 @@ int main() {
   delete[] d_rw2;
   delete[] d_wup;
   delete[] d_wdn;
+  delete[] d_wqkv;
   delete[] d_kc;
   delete[] d_vc;
+
+  cublasDestroy(cb_handle);
 
   std::cout << "\nDone." << std::endl;
   return 0;
