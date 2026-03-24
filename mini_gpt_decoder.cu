@@ -520,6 +520,11 @@ int main() {
   std::vector<float> h_logits(config.vocab_size);
 
   for (int step = 0; step < 1024; step++) {
+    if (step >= config.max_seq_len) {
+      std::cout << "\n[Warning] Reached maximum context length ("
+                << config.max_seq_len << "). Stopping generation." << std::endl;
+      break;
+    }
     // 调用封装好的 forward
     gpt_forward(cb_handle, current_id, step, config, d_x, d_tmp, d_attn,
                 d_ffn_i, d_ffn_o, d_logits, d_qkv, d_q, d_kn, d_vn, d_emb,
