@@ -721,7 +721,7 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     token = next_token;
-    forward(config, w, state, token, pos + 1);
+    forward(config, w, state, token, pos);
   }
   printf("\n");
 
