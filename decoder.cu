@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <string>
 
 struct Config {
@@ -50,12 +51,15 @@ struct Tokenizer {
 struct RunState {
   // [dim] 当前 token 的隐藏状态，每层 attention/FFN 都在这上边做 in-place 更新
   float* x;
-  float* xb;  // [dim] RSMNorm 输出缓冲区，避免覆盖 x
-  float* q;   // [dim] 当前 token 的 Query 向量
-  float* k;   // [kv_dim] 当前 token 的 Key 向量
-  float* v;   // [kv_dim] 当前 token 的 Value 向量
+  float* xb;   // [dim] RSMNorm 输出缓冲区，避免覆盖 x
+  float* xb2;  // [dim] attention/FFN 输出投影的临时缓冲区
+  float* q;    // [dim] 当前 token 的 Query 向量
+  float* k;    // [kv_dim] 当前 token 的 Key 向量
+  float* v;    // [kv_dim] 当前 token 的 Value 向量
   //[n_heads, seq_len] 每个 head 对所有历史 token 的 attention score
   float* att;
+  float* hb;      // [hidden_dim] FFN 中间结果: SiLU(w1(x))
+  float* hb2;     // [hidden_dim] FFN 中间结果: w3(x)
   float* logits;  // [vocab_size] 最终输出的 logits, 用来采样下一个 token
   // [n_layers, seq_len, kv_dim] 所有层的 Key Cache, 避免重复计算历史 token
   float* k_cache;
@@ -80,7 +84,8 @@ int load_config(Config& config, std::string& model_file) {
   return 0;
 }
 
-int load_weights(Weights& w, const Config& config, float* data) {
+int load_weights(Weights& w, const Config& config, float* data,
+                 const ModelFile& mf) {
   int head_dim = config.dim / config.n_heads;
   float* ptr = data;
 
@@ -111,8 +116,8 @@ int load_weights(Weights& w, const Config& config, float* data) {
   w.freq_cis_imag = ptr;
   ptr += config.seq_len * head_dim / 2;
 
-  // vocab_size 为负数时与 token_embedding 区享
-  if (config.vocab_size > 0) {
+  size_t wcls_offset = (ptr - (float*)data) * sizeof(float) + sizeof(Config);
+  if (wcls_offset < mf.size) {
     w.wcls = ptr;
   } else {
     w.wcls = w.token_embedding;
@@ -231,13 +236,16 @@ int alloc_run_state(RunState& s, const Config& config) {
   int n_heads = config.n_heads;
   int seq_len = config.seq_len;
 
-  s.x = new float[dim];                                // 隐藏状态
-  s.xb = new float[dim];                               // RUMNorm 输出
-  s.q = new float[dim];                                // Query
-  s.k = new float[kv_dim];                             // Key
-  s.v = new float[kv_dim];                             // Value
-  s.att = new float[n_heads * seq_len];                // attention scores
-  s.logits = new float[config.vocab_size];             // 输出 logits
+  s.x = new float[dim];                  // 隐藏状态
+  s.xb = new float[dim];                 // RUMNorm 输出
+  s.xb2 = new float[dim];                // attention/FFN 输出投影的临时缓冲区
+  s.q = new float[dim];                  // Query
+  s.k = new float[kv_dim];               // Key
+  s.v = new float[kv_dim];               // Value
+  s.att = new float[n_heads * seq_len];  // attention scores
+  s.hb = new float[config.hidden_dim];   // FFN 中间结果: SiLU(w1(x))
+  s.hb2 = new float[config.hidden_dim];  // FFN 中间结果: w3(x)
+  s.logits = new float[abs(config.vocab_size)];        // 输出 logits
   s.k_cache = new float[n_layers * seq_len * kv_dim];  // KV Cache: Key
   s.v_cache = new float[n_layers * seq_len * kv_dim];  // KV Cache: Value
 
@@ -247,10 +255,13 @@ int alloc_run_state(RunState& s, const Config& config) {
 void free_run_state(RunState& s) {
   delete[] s.x;
   delete[] s.xb;
+  delete[] s.xb2;
   delete[] s.q;
   delete[] s.k;
   delete[] s.v;
   delete[] s.att;
+  delete[] s.hb;
+  delete[] s.hb2;
   delete[] s.logits;
   delete[] s.k_cache;
   delete[] s.v_cache;
@@ -378,6 +389,11 @@ void attention(RunState& s, const Config& config, int layer, int pos,
   }
 }
 
+/**
+ * 激活函数 SiLU: x * sigmoid(x)
+ */
+float silu(float x) { return x * (1.0f / (1.0f + expf(-x))); }
+
 void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
   int dim = config.dim;
 
@@ -414,10 +430,52 @@ void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
 
     // attention
     attention(s, config, l, pos, kv_dim, head_dim);
-
     // attention 输出投影: xb = xb @ wo
-    matmul(s.x, s.xb, w.wo + l * dim * dim, dim, dim);
+    matmul(s.xb2, s.xb, w.wo + l * dim * dim, dim, dim);
+    for (int i = 0; i < dim; i++) {
+      s.x[i] += s.xb2[i];
+    }
+
+    // FFN 前的 RMSNorm
+    rmsnorm(s.xb, s.x, w.rms_ffn + l * dim, dim);
+
+    /**
+     * FFN(x) = w2(SiLU(w1(x)) * w3(x))
+     */
+    matmul(s.hb, s.xb, w.w1 + l * config.hidden_dim * dim, dim,
+           config.hidden_dim);
+    matmul(s.hb2, s.xb, w.w3 + l * config.hidden_dim * dim, dim,
+           config.hidden_dim);
+    for (int i = 0; i < config.hidden_dim; i++) {
+      s.hb[i] = silu(s.hb[i]) * s.hb2[i];
+    }
+
+    // FFN 输出投影 + 残差连接
+    matmul(s.xb2, s.hb, w.w2 + l * dim * config.hidden_dim, config.hidden_dim,
+           dim);
+    for (int i = 0; i < dim; i++) {
+      s.x[i] += s.xb2[i];
+    }
   }
+
+  // 最终 RMSNorm
+  rmsnorm(s.xb, s.x, w.rms_final, dim);
+
+  // 输出 logits
+  matmul(s.logits, s.xb, w.wcls, dim, abs(config.vocab_size));
+}
+
+int argmax(const float* logits, int size) {
+  int max_idx = 0;
+  float max_val = logits[0];
+  for (int i = 1; i < size; i++) {
+    if (logits[i] > max_val) {
+      max_val = logits[i];
+      max_idx = i;
+    }
+  }
+
+  return max_idx;
 }
 
 int main(int argc, char** argv) {
@@ -448,35 +506,37 @@ int main(int argc, char** argv) {
 
   float* data = (float*)((char*)mf.data + sizeof(Config));
   Weights w;
-  load_weights(w, config, data);
-
-  printf("token_embedding[0] = %f\n", w.token_embedding[0]);
-  printf("rms_final[0]       = %f\n", w.rms_final[0]);
+  load_weights(w, config, data, mf);
 
   Tokenizer tokenizer;
   if (load_tokenizer(tokenizer, tokenizer_file, abs(config.vocab_size)) != 0) {
     return 1;
   }
-  // 验证一下几个 token
-  printf("vocab[0]     = %s\n", tokenizer.vocab[0]);
-  printf("vocab[1]     = %s\n", tokenizer.vocab[1]);
-  printf("vocab[100]   = %s\n", tokenizer.vocab[100]);
-  printf("vocab[1000]  = %s\n", tokenizer.vocab[1000]);
-
-  // prev_token 传上一个 token id，第一个 token 传 1 (BOS)
-  int prev_token = 1;
-  int token = 1000;
-  printf("%s\n", decode(tokenizer, prev_token, token));
 
   RunState state;
   alloc_run_state(state, config);
 
-  // BOS token = 1，pos = 0
-  forward(config, w, state, 1, 0);
-  printf("x[0] = %f\n", state.x[0]);
-  printf("q[0] = %f\n", state.q[0]);
-  printf("k[0] = %f\n", state.k[0]);
-  printf("v[0] = %f\n", state.v[0]);
+  int vocab_size = abs(config.vocab_size);
+  int steps = 256;
+  int prev_token = 1;
+  int token = 1;
+  for (int pos = 0; pos < steps; pos++) {
+    forward(config, w, state, token, pos);
+
+    int next_token = argmax(state.logits, vocab_size);
+
+    // EOS(2) 停止
+    if (next_token == 2) {
+      break;
+    }
+
+    printf("%s", decode(tokenizer, prev_token, next_token));
+    fflush(stdout);
+
+    prev_token = next_token;
+    token = next_token;
+  }
+  printf("\n");
 
   free_run_state(state);
   free_tokenizer(tokenizer);

@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.18) # 建议 3.18+ 以获得更好的 CUDA 支持
 project(MiniGptDecoder CUDA)        # 声明项目语言包含 CUDA
 
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
 # 设置 C++ 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
