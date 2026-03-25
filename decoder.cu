@@ -43,7 +43,24 @@ struct Tokenizer {
   int vocab_size;        // 词表大小
   int max_token_length;  // 最长 token 的字符数，用于分配 encode 缓冲区
   char** vocab;          // 词表字符串数组，vocab[i] 是第 i 个 token 的字符串
-  float* vocab_scores;   // BPE merge 优先级分数，vocab_scores[i]
+  // BPE merge 优先级分数，vocab_scores[i] 对应第 i 个 token
+  float* vocab_scores;
+};
+
+struct RunState {
+  // [dim] 当前 token 的隐藏状态，每层 attention/FFN 都在这上边做 in-place 更新
+  float* x;
+  float* xb;  // [dim] RSMNorm 输出缓冲区，避免覆盖 x
+  float* q;   // [dim] 当前 token 的 Query 向量
+  float* k;   // [dim] 当前 token 的 Key 向量
+  float* v;   // [dim] 当前 token 的 Value 向量
+  //[n_heads, seq_len] 每个 head 对所有历史 token 的 attention score
+  float* att;
+  float* logits;  // [vocab_size] 最终输出的 logits, 用来采样下一个 token
+  // [n_layers, seq_len, dim] 所有层的 Key Cache, 避免重复计算历史 token
+  float* k_cache;
+  // [n_layers, seq_len, dim] 所有层的 Value Cache，避免重复计算历史 token
+  float* v_cache;
 };
 
 int load_config(Config& config, std::string& model_file) {
@@ -207,6 +224,46 @@ const char* decode(Tokenizer& t, int prev_token, int token) {
   return piece;
 }
 
+int alloc_run_state(RunState& s, const Config& config) {
+  int dim = config.dim;
+  int n_layers = config.n_layers;
+  int n_heads = config.n_heads;
+  int seq_len = config.seq_len;
+
+  s.x = new float[dim];                             // 隐藏状态
+  s.xb = new float[dim];                            // RUMNorm 输出
+  s.q = new float[dim];                             // Query
+  s.k = new float[dim];                             // Key
+  s.v = new float[dim];                             // Value
+  s.att = new float[n_heads * seq_len];             // attention scores
+  s.logits = new float[config.vocab_size];          // 输出 logits
+  s.k_cache = new float[n_layers * seq_len * dim];  // KV Cache: Key
+  s.v_cache = new float[n_layers * seq_len * dim];  // KV Cache: Value
+
+  return 0;
+}
+
+void free_run_state(RunState& s) {
+  delete[] s.x;
+  delete[] s.xb;
+  delete[] s.q;
+  delete[] s.k;
+  delete[] s.v;
+  delete[] s.att;
+  delete[] s.logits;
+  delete[] s.k_cache;
+  delete[] s.v_cache;
+}
+
+void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
+  int dim = config.dim;
+
+  // 1.Embedding lookup
+  // 从 token embedding 表里取出第 token 行，作为初始隐藏状态
+  float* emb = w.token_embedding + token * dim;
+  memcpy(s.x, emb, dim * sizeof(float));
+}
+
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <model_file> <tokenizer_file>\n", argv[0]);
@@ -240,8 +297,6 @@ int main(int argc, char** argv) {
   printf("token_embedding[0] = %f\n", w.token_embedding[0]);
   printf("rms_final[0]       = %f\n", w.rms_final[0]);
 
-  close_model(mf);
-
   Tokenizer tokenizer;
   if (load_tokenizer(tokenizer, tokenizer_file, abs(config.vocab_size)) != 0) {
     return 1;
@@ -255,8 +310,17 @@ int main(int argc, char** argv) {
   // prev_token 传上一个 token id，第一个 token 传 1 (BOS)
   int prev_token = 1;
   int token = 1000;
-  printf("%s", decode(tokenizer, prev_token, token));
+  printf("%s\n", decode(tokenizer, prev_token, token));
 
+  RunState state;
+  alloc_run_state(state, config);
+
+  // BOS token = 1，pos = 0
+  forward(config, w, state, 1, 0);
+  printf("x[0] = %f\n", state.x[0]);
+
+  free_run_state(state);
   free_tokenizer(tokenizer);
+  close_model(mf);
   return 0;
 }
