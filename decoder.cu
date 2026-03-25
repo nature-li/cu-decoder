@@ -52,14 +52,14 @@ struct RunState {
   float* x;
   float* xb;  // [dim] RSMNorm 输出缓冲区，避免覆盖 x
   float* q;   // [dim] 当前 token 的 Query 向量
-  float* k;   // [dim] 当前 token 的 Key 向量
-  float* v;   // [dim] 当前 token 的 Value 向量
+  float* k;   // [kv_dim] 当前 token 的 Key 向量
+  float* v;   // [kv_dim] 当前 token 的 Value 向量
   //[n_heads, seq_len] 每个 head 对所有历史 token 的 attention score
   float* att;
   float* logits;  // [vocab_size] 最终输出的 logits, 用来采样下一个 token
-  // [n_layers, seq_len, dim] 所有层的 Key Cache, 避免重复计算历史 token
+  // [n_layers, seq_len, kv_dim] 所有层的 Key Cache, 避免重复计算历史 token
   float* k_cache;
-  // [n_layers, seq_len, dim] 所有层的 Value Cache，避免重复计算历史 token
+  // [n_layers, seq_len, kv_dim] 所有层的 Value Cache，避免重复计算历史 token
   float* v_cache;
 };
 
@@ -226,19 +226,20 @@ const char* decode(Tokenizer& t, int prev_token, int token) {
 
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
+  int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
   int n_layers = config.n_layers;
   int n_heads = config.n_heads;
   int seq_len = config.seq_len;
 
-  s.x = new float[dim];                             // 隐藏状态
-  s.xb = new float[dim];                            // RUMNorm 输出
-  s.q = new float[dim];                             // Query
-  s.k = new float[dim];                             // Key
-  s.v = new float[dim];                             // Value
-  s.att = new float[n_heads * seq_len];             // attention scores
-  s.logits = new float[config.vocab_size];          // 输出 logits
-  s.k_cache = new float[n_layers * seq_len * dim];  // KV Cache: Key
-  s.v_cache = new float[n_layers * seq_len * dim];  // KV Cache: Value
+  s.x = new float[dim];                                // 隐藏状态
+  s.xb = new float[dim];                               // RUMNorm 输出
+  s.q = new float[dim];                                // Query
+  s.k = new float[kv_dim];                             // Key
+  s.v = new float[kv_dim];                             // Value
+  s.att = new float[n_heads * seq_len];                // attention scores
+  s.logits = new float[config.vocab_size];             // 输出 logits
+  s.k_cache = new float[n_layers * seq_len * kv_dim];  // KV Cache: Key
+  s.v_cache = new float[n_layers * seq_len * kv_dim];  // KV Cache: Value
 
   return 0;
 }
@@ -326,6 +327,57 @@ void rope(float* q, float* k, const float* freq_real, const float* freq_imag,
   }
 }
 
+void attention(RunState& s, const Config& config, int layer, int pos,
+               int kv_dim, int head_dim) {
+  // GQA 时每个 KV 头服务几个 Q 头
+  int kv_mul = config.n_heads / config.n_kv_heads;
+  float scale = 1.0f / sqrtf((float)head_dim);
+
+  float* k_cache_layer = s.k_cache + layer * config.seq_len * kv_dim;
+  float* v_cache_layer = s.v_cache + layer * config.seq_len * kv_dim;
+
+  for (int h = 0; h < config.n_heads; h++) {
+    // 当前 head 的 Q
+    float* q_head = s.q + h * head_dim;
+    // 存储当前 head 的 scores
+    float* att_head = s.att + h * config.seq_len;
+
+    // Q @ K^T -> scores
+    for (int t = 0; t <= pos; t++) {
+      float* k_head = k_cache_layer + t * kv_dim + (h / kv_mul) * head_dim;
+      float score = 0.0f;
+      for (int d = 0; d < head_dim; d++) {
+        score += q_head[d] * k_head[d];
+      }
+      att_head[t] = score * scale;
+    }
+
+    // softmax
+    float max_val = att_head[0];
+    for (int t = 1; t <= pos; t++) {
+      max_val = fmaxf(max_val, att_head[t]);
+    }
+    float sum = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+      att_head[t] = expf(att_head[t] - max_val);
+      sum += att_head[t];
+    }
+    for (int t = 0; t <= pos; t++) {
+      att_head[t] /= sum;
+    }
+
+    // score @ V -> 输出
+    float* out_head = s.xb + h * head_dim;
+    memset(out_head, 0, head_dim * sizeof(float));
+    for (int t = 0; t <= pos; t++) {
+      float* v_head = v_cache_layer + t * kv_dim + (h / kv_mul) * head_dim;
+      for (int d = 0; d < head_dim; d++) {
+        out_head[d] += att_head[t] * v_head[d];
+      }
+    }
+  }
+}
+
 void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
   int dim = config.dim;
 
@@ -351,6 +403,20 @@ void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
     // RoPE
     rope(s.q, s.k, w.freq_cis_real, w.freq_cis_imag, pos, dim, kv_dim,
          head_dim);
+
+    // 写入 KV Cache
+    // 当前层 KV Cache 的起始指针
+    float* k_cache_layer = s.k_cache + l * config.seq_len * kv_dim;
+    float* v_cache_layer = s.v_cache + l * config.seq_len * kv_dim;
+    // 把当前 pos 的 K/V 写入 cache
+    memcpy(k_cache_layer + pos * kv_dim, s.k, kv_dim * sizeof(float));
+    memcpy(v_cache_layer + pos * kv_dim, s.v, kv_dim * sizeof(float));
+
+    // attention
+    attention(s, config, l, pos, kv_dim, head_dim);
+
+    // attention 输出投影: xb = xb @ wo
+    matmul(s.x, s.xb, w.wo + l * dim * dim, dim, dim);
   }
 }
 
