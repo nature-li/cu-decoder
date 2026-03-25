@@ -293,6 +293,39 @@ void matmul(float* out, const float* x, const float* w, int n, int d) {
   }
 }
 
+/**
+ * [x0, x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]
+ *
+ * 参数:
+ * - freq_real: [seq_len, head_dim/2]
+ * - freq_imag: [seq_len, head_dim/2]
+ */
+void rope(float* q, float* k, const float* freq_real, const float* freq_imag,
+          int pos, int dim, int kv_dim, int head_dim) {
+  // 每两个元素做一次旋转, Q 和 K 都要做
+  for (int i = 0; i < dim; i += 2) {
+    int head_pos = i % head_dim;
+    float cos_val = freq_real[pos * head_dim / 2 + head_pos / 2];
+    float sin_val = freq_imag[pos * head_dim / 2 + head_pos / 2];
+
+    float q0 = q[i];
+    float q1 = q[i + 1];
+    q[i] = q0 * cos_val - q1 * sin_val;
+    q[i + 1] = q0 * sin_val + q1 * cos_val;
+  }
+
+  for (int i = 0; i < kv_dim; i += 2) {
+    int head_pos = i % head_dim;
+    float cos_val = freq_real[pos * head_dim / 2 + head_pos / 2];
+    float sin_val = freq_imag[pos * head_dim / 2 + head_pos / 2];
+
+    float k0 = k[i];
+    float k1 = k[i + 1];
+    k[i] = k0 * cos_val - k1 * sin_val;
+    k[i + 1] = k0 * sin_val + k1 * cos_val;
+  }
+}
+
 void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
   int dim = config.dim;
 
@@ -304,6 +337,7 @@ void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
   // 2.过第一层
   for (int l = 0; l < config.n_layers; l++) {
     int head_dim = config.dim / config.n_heads;
+    // K/V 向量的总长度, 等于 n_kv_heads * head_dim
     int kv_dim = config.n_kv_heads * head_dim;
 
     // attention 前的 RMSNorm
@@ -313,6 +347,10 @@ void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
     matmul(s.q, s.xb, w.wq + l * dim * dim, dim, dim);
     matmul(s.k, s.xb, w.wk + l * kv_dim * dim, dim, kv_dim);
     matmul(s.v, s.xb, w.wv + l * kv_dim * dim, dim, kv_dim);
+
+    // RoPE
+    rope(s.q, s.k, w.freq_cis_real, w.freq_cis_imag, pos, dim, kv_dim,
+         head_dim);
   }
 }
 
