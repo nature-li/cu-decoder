@@ -181,6 +181,32 @@ void free_tokenizer(Tokenizer& t) {
   delete[] t.vocab_scores;
 }
 
+const char* decode(Tokenizer& t, int prev_token, int token) {
+  char* piece = t.vocab[token];
+
+  /**
+   * BOS(1) 后面跟 token 如果以空格开头, 去掉空格, 比如:
+   * " hello" 在句首应该输出 "hello"
+   */
+  if (prev_token == 1 && piece[0] == ' ') {
+    piece++;
+  }
+
+  /**
+   * 处理 <0x61> 这种原始字节 token, 转成对应字符
+   * 格式固定是 <0xXX>, 长度 6
+   */
+  unsigned char byte_val;
+  if (sscanf(piece, "<0x%02hhx>", &byte_val) == 1) {
+    static char byte_piece[2];
+    byte_piece[0] = (char)byte_val;
+    byte_piece[1] = '\0';
+    return byte_piece;
+  }
+
+  return piece;
+}
+
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <model_file> <tokenizer_file>\n", argv[0]);
@@ -225,6 +251,12 @@ int main(int argc, char** argv) {
   printf("vocab[1]     = %s\n", tokenizer.vocab[1]);
   printf("vocab[100]   = %s\n", tokenizer.vocab[100]);
   printf("vocab[1000]  = %s\n", tokenizer.vocab[1000]);
+
+  // prev_token 传上一个 token id，第一个 token 传 1 (BOS)
+  int prev_token = 1;
+  int token = 1000;
+  printf("%s", decode(tokenizer, prev_token, token));
+
   free_tokenizer(tokenizer);
   return 0;
 }
