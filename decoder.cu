@@ -2,9 +2,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
+#include <random>
 #include <string>
 
 struct Config {
@@ -478,6 +482,96 @@ int argmax(const float* logits, int size) {
   return max_idx;
 }
 
+/**
+ * temperature 采样
+ * temperature 越高分布越平坦 (更随机), 越低越集中 (更确定)
+ * temperature = 0 退化为 argmax
+ */
+int sample(const float* logits, int size, float temperature,
+           std::mt19937& rng) {
+  if (temperature == 0.0f) {
+    return argmax(logits, size);
+  }
+
+  // 除以 temperature，缩放 logits
+  std::vector<float> probs(size);
+  float max_val = logits[0];
+  for (int i = 1; i < size; i++) {
+    max_val = fmaxf(max_val, logits[i]);
+  }
+
+  float sum = 0.0f;
+  for (int i = 0; i < size; i++) {
+    probs[i] = expf((logits[i] - max_val) / temperature);
+    sum += probs[i];
+  }
+
+  for (int i = 0; i < size; i++) {
+    probs[i] /= sum;
+  }
+
+  // 轮盘赌采样
+  std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+  float r = dis(rng);
+  float cur = 0.0f;
+  for (int i = 0; i < size; i++) {
+    cur += probs[i];
+    if (r <= cur) {
+      return i;
+    }
+  }
+
+  return size - 1;
+}
+
+/**
+ * top-k 采样
+ * 只保留概率最高的 k 个 token，其余归零，再做 temperature 采样
+ */
+int sample_topk(const float* logits, int size, int k, float temperature,
+                std::mt19937& rng) {
+  if (k <= 0 || k >= size) {
+    return sample(logits, size, temperature, rng);
+  }
+
+  // 找第 k 大的阈值
+  std::vector<float> tmp(logits, logits + size);
+  std::nth_element(tmp.begin(), tmp.begin() + k - 1, tmp.end(),
+                   std::greater<float>());
+  float threshold = tmp[k - 1];
+
+  // 低于阈值的归零，其余做 softmax
+  std::vector<float> probs(size);
+  float max_val = logits[0];
+  for (int i = 1; i < size; i++) {
+    max_val = fmaxf(max_val, logits[i]);
+  }
+
+  float sum = 0.0f;
+  for (int i = 0; i < size; i++) {
+    if (logits[i] >= threshold) {
+      probs[i] = expf((logits[i] - max_val) / temperature);
+    } else {
+      probs[i] = 0.0f;
+    }
+    sum += probs[i];
+  }
+
+  for (int i = 0; i < size; i++) {
+    probs[i] /= sum;
+  }
+
+  // 轮盘赌采样
+  std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+  float r = dis(rng);
+  float cur = 0.0f;
+  for (int i = 0; i < size; i++) {
+    cur += probs[i];
+    if (r <= cur) return i;
+  }
+  return size - 1;
+}
+
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <model_file> <tokenizer_file>\n", argv[0]);
@@ -511,10 +605,14 @@ int main(int argc, char** argv) {
   int vocab_size = abs(config.vocab_size);
   int steps = 256;
   int token = 1;
+  std::mt19937 rng(time(nullptr));  // 随机种子
+  float temperature = 0.8f;
+  int top_k = 40;
   for (int pos = 0; pos < steps; pos++) {
     forward(config, w, state, token, pos);
 
-    int next_token = argmax(state.logits, vocab_size);
+    int next_token =
+        sample_topk(state.logits, vocab_size, top_k, temperature, rng);
 
     // EOS(2) 停止
     if (next_token == 2) {
