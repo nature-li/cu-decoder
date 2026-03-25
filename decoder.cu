@@ -33,6 +33,19 @@ struct Weights {
   float* wcls;           // [vocab_size, dim] 输出层投影矩阵
 };
 
+struct ModelFile {
+  int fd;       // 文件描述符
+  void* data;   // mmap 映射的内存起始地址
+  size_t size;  // 文件总大小（字节）
+};
+
+struct Tokenizer {
+  int vocab_size;        // 词表大小
+  int max_token_length;  // 最长 token 的字符数，用于分配 encode 缓冲区
+  char** vocab;          // 词表字符串数组，vocab[i] 是第 i 个 token 的字符串
+  float* vocab_scores;   // BPE merge 优先级分数，vocab_scores[i]
+};
+
 int load_config(Config& config, std::string& model_file) {
   FILE* f = fopen(model_file.c_str(), "rb");
   if (!f) {
@@ -49,12 +62,6 @@ int load_config(Config& config, std::string& model_file) {
   fclose(f);
   return 0;
 }
-
-struct ModelFile {
-  int fd;
-  void* data;
-  size_t size;
-};
 
 int load_weights(Weights& w, const Config& config, float* data) {
   int head_dim = config.dim / config.n_heads;
@@ -120,14 +127,69 @@ void close_model(ModelFile& mf) {
   close(mf.fd);
 }
 
-int main(int argc, char** argv) {
-  if (argc < 2) {
-    fprintf(stderr, "Usage: %s <model_file>\n", argv[0]);
-    return 1;
+int load_tokenizer(Tokenizer& t, const std::string& tokenizer_file,
+                   int vocab_size) {
+  t.vocab_size = vocab_size;
+  t.vocab = new char*[vocab_size];
+  t.vocab_scores = new float[vocab_size];
+
+  FILE* f = fopen(tokenizer_file.c_str(), "rb");
+  if (!f) {
+    fprintf(stderr, "failed to open: %s\n", tokenizer_file.c_str());
+    return -1;
   }
 
-  Config config;
+  if (fread(&t.max_token_length, sizeof(int), 1, f) != 1) {
+    fprintf(stderr, "failed to read max_token_length\n");
+    fclose(f);
+    return -1;
+  }
+
+  for (int i = 0; i < vocab_size; i++) {
+    if (fread(&t.vocab_scores[i], sizeof(float), 1, f) != 1) {
+      fprintf(stderr, "failed to read vocab_scores[%d]\n", i);
+      fclose(f);
+      return -1;
+    }
+
+    int len;
+    if (fread(&len, sizeof(int), 1, f) != 1) {
+      fprintf(stderr, "failed to read token length[%d]\n", i);
+      fclose(f);
+      return -1;
+    }
+
+    t.vocab[i] = new char[len + 1];  // +1 for '\0'
+    if (fread(t.vocab[i], sizeof(char), len, f) != (size_t)len) {
+      fprintf(stderr, "failed to read token string[%d]\n", i);
+      fclose(f);
+      return -1;
+    }
+    t.vocab[i][len] = '\0';
+  }
+
+  fclose(f);
+  return 0;
+}
+
+void free_tokenizer(Tokenizer& t) {
+  for (int i = 0; i < t.vocab_size; i++) {
+    delete[] t.vocab[i];
+  }
+
+  delete[] t.vocab;
+  delete[] t.vocab_scores;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 3) {
+    fprintf(stderr, "Usage: %s <model_file> <tokenizer_file>\n", argv[0]);
+    return 1;
+  }
   std::string model_file = argv[1];
+  std::string tokenizer_file = argv[2];
+
+  Config config;
   if (load_config(config, model_file) != 0) {
     return 1;
   }
@@ -154,5 +216,15 @@ int main(int argc, char** argv) {
 
   close_model(mf);
 
+  Tokenizer tokenizer;
+  if (load_tokenizer(tokenizer, tokenizer_file, abs(config.vocab_size)) != 0) {
+    return 1;
+  }
+  // 验证一下几个 token
+  printf("vocab[0]     = %s\n", tokenizer.vocab[0]);
+  printf("vocab[1]     = %s\n", tokenizer.vocab[1]);
+  printf("vocab[100]   = %s\n", tokenizer.vocab[100]);
+  printf("vocab[1000]  = %s\n", tokenizer.vocab[1000]);
+  free_tokenizer(tokenizer);
   return 0;
 }
