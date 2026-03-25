@@ -572,6 +572,74 @@ int sample_topk(const float* logits, int size, int k, float temperature,
   return size - 1;
 }
 
+/**
+ * 在词表里查找 str，返回 token id，找不到返回 -1
+ */
+int vocab_lookup(Tokenizer& t, const char* str) {
+  for (int i = 0; i < t.vocab_size; i++) {
+    if (strcmp(t.vocab[i], str) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * BPE encode: string -> token ids
+ * 结果写入 tokens，返回 token 数量
+ */
+int encode(Tokenizer& t, const std::string& text, int* tokens) {
+  int n_tokens = 0;
+
+  // 每个字符先单独变成 token
+  char buf[16] = {};
+  for (unsigned char c : text) {
+    snprintf(buf, sizeof(buf), "%c", c);
+    int id = vocab_lookup(t, buf);
+    if (id == -1) {
+      // 找不到就用字节 token <0xXX>
+      snprintf(buf, sizeof(buf), "<0x%02X>", c);
+      id = vocab_lookup(t, buf);
+    }
+    if (id != -1) {
+      tokens[n_tokens++] = id;
+    }
+  }
+
+  // 反复合并 score 最高的相邻 pair
+  char merge_buf[512];
+  while (true) {
+    int best_id = -1;
+    float best_score = -1e10f;
+    int best_idx = -1;
+
+    for (int i = 0; i < n_tokens - 1; i++) {
+      // 拼接相邻两个 token 的字符串
+      snprintf(merge_buf, sizeof(merge_buf), "%s%s", t.vocab[tokens[i]],
+               t.vocab[tokens[i + 1]]);
+      int id = vocab_lookup(t, merge_buf);
+      if (id != -1 && t.vocab_scores[id] > best_score) {
+        best_score = t.vocab_scores[id];
+        best_id = id;
+        best_idx = i;
+      }
+    }
+
+    // 没有可合并的 pair 了，结束
+    if (best_idx == -1) {
+      break;
+    }
+
+    // 合并 best_idx 和 best_idx+1
+    tokens[best_idx] = best_id;
+    for (int i = best_idx + 1; i < n_tokens - 1; i++) {
+      tokens[i] = tokens[i + 1];
+    }
+    n_tokens--;
+  }
+
+  return n_tokens;
+}
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <model_file> <tokenizer_file>\n", argv[0]);
@@ -584,6 +652,13 @@ int main(int argc, char** argv) {
   if (load_config(config, model_file) != 0) {
     return 1;
   }
+  printf("dim        = %d\n", config.dim);
+  printf("hidden_dim = %d\n", config.hidden_dim);
+  printf("n_layers   = %d\n", config.n_layers);
+  printf("n_heads    = %d\n", config.n_heads);
+  printf("n_kv_heads = %d\n", config.n_kv_heads);
+  printf("vocab_size = %d\n", config.vocab_size);
+  printf("seq_len    = %d\n", config.seq_len);
 
   ModelFile mf;
   if (open_model(model_file, mf) != 0) {
@@ -598,24 +673,47 @@ int main(int argc, char** argv) {
   if (load_tokenizer(tokenizer, tokenizer_file, abs(config.vocab_size)) != 0) {
     return 1;
   }
+  // BOS 和 EOS
+  printf("vocab[1] = %s\n", tokenizer.vocab[1]);
+  printf("vocab[2] = %s\n", tokenizer.vocab[2]);
 
   RunState state;
   alloc_run_state(state, config);
 
   int vocab_size = abs(config.vocab_size);
-  int steps = 256;
-  int token = 1;
-  std::mt19937 rng(time(nullptr));  // 随机种子
+  int steps = config.seq_len;
+  std::mt19937 rng(time(nullptr));
   float temperature = 0.8f;
   int top_k = 40;
-  for (int pos = 0; pos < steps; pos++) {
-    forward(config, w, state, token, pos);
 
+  // 读用户输入
+  std::string prompt;
+  printf("Enter prompt: ");
+  std::getline(std::cin, prompt);
+
+  // encode prompt -> token ids
+  std::vector<int> prompt_tokens(prompt.size() + 10);
+  int n_prompt = encode(tokenizer, prompt, prompt_tokens.data());
+
+  // prefill
+  int token = 1;  // BOS
+  int pos = 0;
+  forward(config, w, state, token, pos++);  // 先跑 BOS
+  for (int i = 0; i < n_prompt; i++) {
+    if (pos >= config.seq_len) {
+      fprintf(stderr, "prompt too long, max %d tokens\n", config.seq_len - 1);
+      return 1;
+    }
+    token = prompt_tokens[i];
+    forward(config, w, state, token, pos++);
+  }
+
+  // 生成阶段
+  for (; pos < steps; pos++) {
     int next_token =
         sample_topk(state.logits, vocab_size, top_k, temperature, rng);
-
-    // EOS(2) 停止
-    if (next_token == 2) {
+    // EOS
+    if (next_token == 1 || next_token == 2) {
       break;
     }
 
@@ -623,6 +721,7 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     token = next_token;
+    forward(config, w, state, token, pos + 1);
   }
   printf("\n");
 
