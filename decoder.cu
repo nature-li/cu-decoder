@@ -255,6 +255,24 @@ void free_run_state(RunState& s) {
   delete[] s.v_cache;
 }
 
+/**
+ * rms(x) = sqrt(mean(x^2) + 1e-6)
+ * RMSNorm(x) = x / rms(x) * weight
+ */
+void rmsnorm(float* out, const float* x, const float* weight, int dim) {
+  // 计算 x 的均方根
+  float ss = 0.0f;
+  for (int i = 0; i < dim; i++) {
+    ss += x[i] * x[i];
+  }
+  ss = 1.0f / sqrtf(ss / dim + 1e-6f);
+
+  // 归一化
+  for (int i = 0; i < dim; i++) {
+    out[i] = x[i] * ss * weight[i];
+  }
+}
+
 void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
   int dim = config.dim;
 
@@ -262,6 +280,12 @@ void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
   // 从 token embedding 表里取出第 token 行，作为初始隐藏状态
   float* emb = w.token_embedding + token * dim;
   memcpy(s.x, emb, dim * sizeof(float));
+
+  // 2.过第一层
+  for (int l = 0; l < config.n_layers; l++) {
+    // attention 前的 RMSNorm
+    rmsnorm(s.xb, s.x, w.rms_att + l * dim, dim);
+  }
 }
 
 int main(int argc, char** argv) {
