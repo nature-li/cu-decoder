@@ -491,14 +491,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  printf("dim        = %d\n", config.dim);
-  printf("hidden_dim = %d\n", config.hidden_dim);
-  printf("n_layers   = %d\n", config.n_layers);
-  printf("n_heads    = %d\n", config.n_heads);
-  printf("n_kv_heads = %d\n", config.n_kv_heads);
-  printf("vocab_size = %d\n", config.vocab_size);
-  printf("seq_len    = %d\n", config.seq_len);
-
   ModelFile mf;
   if (open_model(model_file, mf) != 0) {
     return 1;
@@ -518,7 +510,6 @@ int main(int argc, char** argv) {
 
   int vocab_size = abs(config.vocab_size);
   int steps = 256;
-  int prev_token = 1;
   int token = 1;
   for (int pos = 0; pos < steps; pos++) {
     forward(config, w, state, token, pos);
@@ -530,10 +521,9 @@ int main(int argc, char** argv) {
       break;
     }
 
-    printf("%s", decode(tokenizer, prev_token, next_token));
+    printf("%s", decode(tokenizer, token, next_token));
     fflush(stdout);
 
-    prev_token = next_token;
     token = next_token;
   }
   printf("\n");
