@@ -273,6 +273,26 @@ void rmsnorm(float* out, const float* x, const float* weight, int dim) {
   }
 }
 
+/**
+ * q = xb @ wq
+ * k = xb @ wk
+ * v = xb @ wv
+ *
+ * 参数
+ * - n: 输入维度
+ * - d: 输出维度
+ * - w: [d, n]
+ */
+void matmul(float* out, const float* x, const float* w, int n, int d) {
+  for (int i = 0; i < d; i++) {
+    float val = 0.0f;
+    for (int j = 0; j < n; j++) {
+      val += x[j] * w[i * n + j];
+    }
+    out[i] = val;
+  }
+}
+
 void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
   int dim = config.dim;
 
@@ -283,8 +303,16 @@ void forward(Config& config, Weights& w, RunState& s, int token, int pos) {
 
   // 2.过第一层
   for (int l = 0; l < config.n_layers; l++) {
+    int head_dim = config.dim / config.n_heads;
+    int kv_dim = config.n_kv_heads * head_dim;
+
     // attention 前的 RMSNorm
     rmsnorm(s.xb, s.x, w.rms_att + l * dim, dim);
+
+    // QKV 投影
+    matmul(s.q, s.xb, w.wq + l * dim * dim, dim, dim);
+    matmul(s.k, s.xb, w.wk + l * kv_dim * dim, dim, kv_dim);
+    matmul(s.v, s.xb, w.wv + l * kv_dim * dim, dim, kv_dim);
   }
 }
 
@@ -342,6 +370,9 @@ int main(int argc, char** argv) {
   // BOS token = 1，pos = 0
   forward(config, w, state, 1, 0);
   printf("x[0] = %f\n", state.x[0]);
+  printf("q[0] = %f\n", state.q[0]);
+  printf("k[0] = %f\n", state.k[0]);
+  printf("v[0] = %f\n", state.v[0]);
 
   free_run_state(state);
   free_tokenizer(tokenizer);
