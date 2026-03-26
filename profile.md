@@ -10,7 +10,7 @@ sudo ncu --kernel-name matmul_kernel \
          --launch-skip 0 --launch-count 1 \
          --set full \
          -o profile_matmul_v1 \
-         ./gpu_decoder_v1 ../stories15M.bin ../tokenizer.bin <<< "Once upon a time"
+         ./gpu_decoder_v1 ../stories110M.bin ../tokenizer.bin <<< "Once upon a time"
 
 ### 2.2 查看分析结果
 ncu-ui profile_matmul_v1.ncu-rep
