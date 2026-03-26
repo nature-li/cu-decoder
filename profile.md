@@ -14,3 +14,8 @@ sudo ncu --kernel-name matmul_kernel \
 
 ### 2.2 查看分析结果
 ncu-ui profile_matmul_v1.ncu-rep
+
+## 3.整体分析v3
+sudo nsys profile --stats=true -o profile_v3_110m \
+    ./gpu_decoder_v3 ../stories110M.bin ../tokenizer.bin <<< "Once upon a time"
+nsys-ui profile_v3_110m.nsys-rep
