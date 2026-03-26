@@ -1,3 +1,4 @@
+#include <cuda_runtime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -13,21 +14,31 @@
 
 #include "common.h"
 
+#define CHECK_CUDA(call)                                                      \
+  {                                                                           \
+    cudaError_t err = call;                                                   \
+    if (err != cudaSuccess) {                                                 \
+      fprintf(stderr, "CUDA Error: %s at line %d\n", cudaGetErrorString(err), \
+              __LINE__);                                                      \
+      exit(1);                                                                \
+    }                                                                         \
+  }
+
 struct GPUWeights {
-  float* token_embedding;
-  float* rms_att;
-  float* wq;
-  float* wk;
-  float* wv;
-  float* wo;
-  float* rms_ffn;
-  float* w1;
-  float* w2;
-  float* w3;
-  float* rms_final;
-  float* freq_cis_real;
-  float* freq_cis_imag;
-  float* wcls;
+  float* token_embedding;  // [vocab_size, dim]
+  float* rms_att;          // [n_layers, dim]
+  float* wq;               // [n_layers, dim, dim]
+  float* wk;               // [n_layers, n_kv_heads*head_dim, dim]
+  float* wv;               // [n_layers, n_kv_heads*head_dim, dim]
+  float* wo;               // [n_layers, dim, dim]
+  float* rms_ffn;          // [n_layers, dim]
+  float* w1;               // [n_layers, hidden_dim, dim]
+  float* w2;               // [n_layers, dim, hidden_dim]
+  float* w3;               // [n_layers, hidden_dim, dim]
+  float* rms_final;        // [dim]
+  float* freq_cis_real;    // [seq_len, head_dim/2]
+  float* freq_cis_imag;    // [seq_len, head_dim/2]
+  float* wcls;             // [vocab_size, dim]
 };
 
 struct RunState {
@@ -108,7 +119,58 @@ int load_weights(Weights& w, const Config& config, float* data,
   return 0;
 }
 
-void upload_weights(GPUWeights& gw, const Weights& w, const Config& config) {}
+void upload_weights(GPUWeights& gw, const Weights& w, const Config& config) {
+  int head_dim = config.dim / config.n_heads;
+  int kv_dim = head_dim * config.n_kv_heads;
+  int vocab_size = abs(config.vocab_size);
+
+  auto upload = [](float** dst, const float* src, size_t n) {
+    CHECK_CUDA(cudaMalloc(dst, n * sizeof(float)));
+    CHECK_CUDA(
+        cudaMemcpy(*dst, src, n * sizeof(float), cudaMemcpyHostToDevice));
+  };
+
+  upload(&gw.token_embedding, w.token_embedding, vocab_size * config.dim);
+  upload(&gw.rms_att, w.rms_att, config.n_layers * config.dim);
+  upload(&gw.wq, w.wq, config.n_layers * config.dim * config.dim);
+  upload(&gw.wk, w.wk, config.n_layers * kv_dim * config.dim);
+  upload(&gw.wv, w.wv, config.n_layers * kv_dim * config.dim);
+  upload(&gw.wo, w.wo, config.n_layers * config.dim * config.dim);
+  upload(&gw.rms_ffn, w.rms_ffn, config.n_layers * config.dim);
+  upload(&gw.w1, w.w1, config.n_layers * config.hidden_dim * config.dim);
+  upload(&gw.w2, w.w2, config.n_layers * config.dim * config.hidden_dim);
+  upload(&gw.w3, w.w3, config.n_layers * config.hidden_dim * config.dim);
+  upload(&gw.rms_final, w.rms_final, config.dim);
+  upload(&gw.freq_cis_real, w.freq_cis_real, config.seq_len * head_dim / 2);
+  upload(&gw.freq_cis_imag, w.freq_cis_imag, config.seq_len * head_dim / 2);
+
+  // wcls 共享时指向 token_embedding
+  if (w.wcls == w.token_embedding) {
+    gw.wcls = gw.token_embedding;
+  } else {
+    upload(&gw.wcls, w.wcls, vocab_size * config.dim);
+  }
+}
+
+void free_gpu_weights(GPUWeights& gw, const Weights& w) {
+  cudaFree(gw.token_embedding);
+  cudaFree(gw.rms_att);
+  cudaFree(gw.wq);
+  cudaFree(gw.wk);
+  cudaFree(gw.wv);
+  cudaFree(gw.wo);
+  cudaFree(gw.rms_ffn);
+  cudaFree(gw.w1);
+  cudaFree(gw.w2);
+  cudaFree(gw.w3);
+  cudaFree(gw.rms_final);
+  cudaFree(gw.freq_cis_real);
+  cudaFree(gw.freq_cis_imag);
+  // wcls 共享时不重复释放
+  if (w.wcls != w.token_embedding) {
+    cudaFree(gw.wcls);
+  }
+}
 
 int open_model(const std::string& model_file, ModelFile& mf) {
   mf.fd = open(model_file.c_str(), O_RDONLY);
@@ -620,93 +682,55 @@ int encode(Tokenizer& t, const std::string& text, int* tokens) {
 
   return n_tokens;
 }
+
 int main(int argc, char** argv) {
-  if (argc < 3) {
-    fprintf(stderr, "Usage: %s <model_file> <tokenizer_file>\n", argv[0]);
+  if (argc < 2) {
+    fprintf(stderr, "Usage: %s <model_file>\n", argv[0]);
     return 1;
   }
   std::string model_file = argv[1];
-  std::string tokenizer_file = argv[2];
 
+  // 加载 CPU 权重
   Config config;
-  if (load_config(config, model_file) != 0) {
-    return 1;
-  }
-  printf("dim        = %d\n", config.dim);
-  printf("hidden_dim = %d\n", config.hidden_dim);
-  printf("n_layers   = %d\n", config.n_layers);
-  printf("n_heads    = %d\n", config.n_heads);
-  printf("n_kv_heads = %d\n", config.n_kv_heads);
-  printf("vocab_size = %d\n", config.vocab_size);
-  printf("seq_len    = %d\n", config.seq_len);
+  load_config(config, model_file);
 
   ModelFile mf;
-  if (open_model(model_file, mf) != 0) {
-    return 1;
-  }
+  open_model(model_file, mf);
 
   float* data = (float*)((char*)mf.data + sizeof(Config));
   Weights w;
   load_weights(w, config, data, mf);
 
-  Tokenizer tokenizer;
-  if (load_tokenizer(tokenizer, tokenizer_file, abs(config.vocab_size)) != 0) {
-    return 1;
-  }
-  // BOS 和 EOS
-  printf("vocab[1] = %s\n", tokenizer.vocab[1]);
-  printf("vocab[2] = %s\n", tokenizer.vocab[2]);
+  // 上传到 GPU
+  GPUWeights gw;
+  upload_weights(gw, w, config);
 
-  RunState state;
-  alloc_run_state(state, config);
+  // 读回来对比
+  float cpu_val, gpu_val;
 
-  int vocab_size = abs(config.vocab_size);
-  int steps = config.seq_len;
-  std::mt19937 rng(time(nullptr));
-  float temperature = 0.8f;
-  int top_k = 40;
+  // 验证 token_embedding[0]
+  cpu_val = w.token_embedding[0];
+  CHECK_CUDA(cudaMemcpy(&gpu_val, gw.token_embedding, sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  printf("token_embedding[0]: cpu=%f gpu=%f match=%d\n", cpu_val, gpu_val,
+         cpu_val == gpu_val);
 
-  // 读用户输入
-  std::string prompt;
-  printf("Enter prompt: ");
-  std::getline(std::cin, prompt);
+  // 验证 rms_final[0]
+  cpu_val = w.rms_final[0];
+  CHECK_CUDA(cudaMemcpy(&gpu_val, gw.rms_final, sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  printf("rms_final[0]:       cpu=%f gpu=%f match=%d\n", cpu_val, gpu_val,
+         cpu_val == gpu_val);
 
-  // encode prompt -> token ids
-  std::vector<int> prompt_tokens(prompt.size() + 10);
-  int n_prompt = encode(tokenizer, prompt, prompt_tokens.data());
+  // 验证 wq 最后一个元素
+  int wq_size = config.n_layers * config.dim * config.dim;
+  cpu_val = w.wq[wq_size - 1];
+  CHECK_CUDA(cudaMemcpy(&gpu_val, gw.wq + wq_size - 1, sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  printf("wq[last]:           cpu=%f gpu=%f match=%d\n", cpu_val, gpu_val,
+         cpu_val == gpu_val);
 
-  // prefill
-  int token = 1;  // BOS
-  int pos = 0;
-  forward(config, w, state, token, pos++);  // 先跑 BOS
-  for (int i = 0; i < n_prompt; i++) {
-    if (pos >= config.seq_len) {
-      fprintf(stderr, "prompt too long, max %d tokens\n", config.seq_len - 1);
-      return 1;
-    }
-    token = prompt_tokens[i];
-    forward(config, w, state, token, pos++);
-  }
-
-  // 生成阶段
-  for (; pos < steps; pos++) {
-    int next_token =
-        sample_topk(state.logits, vocab_size, top_k, temperature, rng);
-    // EOS
-    if (next_token == 1 || next_token == 2) {
-      break;
-    }
-
-    printf("%s", decode(tokenizer, token, next_token));
-    fflush(stdout);
-
-    token = next_token;
-    forward(config, w, state, token, pos);
-  }
-  printf("\n");
-
-  free_run_state(state);
-  free_tokenizer(tokenizer);
+  free_gpu_weights(gw, w);
   close_model(mf);
   return 0;
 }
