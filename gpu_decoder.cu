@@ -242,6 +242,29 @@ __global__ void rmsnorm_kernel(float* out, const float* x, const float* weight,
   }
 }
 
+/**
+ * MatMul kernel: out = x @ w^T
+ *
+ * x: [n]      输入向量
+ * w: [d, n]   权重矩阵
+ * out: [d]    输出向量
+ *
+ * Grid:  (d + 255) / 256 个 block
+ * Block: 256 个线程
+ * 线程 i: 计算 out[i] = x 和 w 第 i 行的点积
+ */
+__global__ void matmul_kernel(float* out, const float* x, const float* w, int n,
+                              int d) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < d) {
+    float val = 0.0f;
+    for (int j = 0; j < n; j++) {
+      val += x[j] * w[i * n + j];
+    }
+    out[i] = val;
+  }
+}
+
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
