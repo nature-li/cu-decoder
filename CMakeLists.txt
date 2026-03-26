@@ -33,4 +33,4 @@ endmacro()
 
 # add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
 add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
-add_cuda_target(decoder decoder.cu)
+add_cuda_target(cpu_decoder cpu_decoder.cu)
