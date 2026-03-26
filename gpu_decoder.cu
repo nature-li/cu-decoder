@@ -42,6 +42,22 @@ struct GPUWeights {
   float* wcls;             // [vocab_size, dim]
 };
 
+struct GPURunState {
+  float* x;    // [dim]
+  float* xb;   // [dim]
+  float* xb2;  // [dim]
+  float* q;    // [dim]
+  float* k;    // [kv_dim]
+  float* v;    // [kv_dim]
+  float* att;  // [n_heads, seq_len]
+  float* hb;   // [hidden_dim]
+  float* hb2;  // [hidden_dim]
+  // [vocab_size] 这个需要 CPU 能读到，用 cudaMallocHost 或普通 malloc
+  float* logits;
+  float* k_cache;  // [n_layers, seq_len, kv_dim]
+  float* v_cache;  // [n_layers, seq_len, kv_dim]
+};
+
 struct RunState {
   // [dim] 当前 token 的隐藏状态，每层 attention/FFN 都在这上边做 in-place 更新
   float* x;
@@ -112,6 +128,47 @@ void free_gpu_weights(GPUWeights& gw, const Weights& w) {
   if (w.wcls != w.token_embedding) {
     cudaFree(gw.wcls);
   }
+}
+
+void alloc_gpu_run_state(GPURunState& s, const Config& config) {
+  int dim = config.dim;
+  int kv_dim = config.n_kv_heads * (config.dim / config.n_heads);
+  int n_layers = config.n_layers;
+  int n_heads = config.n_heads;
+  int seq_len = config.seq_len;
+  int vocab_size = abs(config.vocab_size);
+
+  CHECK_CUDA(cudaMalloc(&s.x, dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.xb, dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.xb2, dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.q, dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.k, kv_dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.v, kv_dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.att, n_heads * seq_len * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.hb, config.hidden_dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.hb2, config.hidden_dim * sizeof(float)));
+  CHECK_CUDA(
+      cudaMalloc(&s.k_cache, n_layers * seq_len * kv_dim * sizeof(float)));
+  CHECK_CUDA(
+      cudaMalloc(&s.v_cache, n_layers * seq_len * kv_dim * sizeof(float)));
+
+  // logits 需要频繁从 GPU 读回 CPU 做采样，用 pinned memory 更快
+  CHECK_CUDA(cudaMallocHost(&s.logits, vocab_size * sizeof(float)));
+}
+
+void free_gpu_run_state(GPURunState& s) {
+  cudaFree(s.x);
+  cudaFree(s.xb);
+  cudaFree(s.xb2);
+  cudaFree(s.q);
+  cudaFree(s.k);
+  cudaFree(s.v);
+  cudaFree(s.att);
+  cudaFree(s.hb);
+  cudaFree(s.hb2);
+  cudaFree(s.k_cache);
+  cudaFree(s.v_cache);
+  cudaFreeHost(s.logits);
 }
 
 int alloc_run_state(RunState& s, const Config& config) {
@@ -397,6 +454,10 @@ int main(int argc, char** argv) {
   printf("wq[last]:           cpu=%f gpu=%f match=%d\n", cpu_val, gpu_val,
          cpu_val == gpu_val);
 
+  GPURunState s;
+  alloc_gpu_run_state(s, config);
+
+  free_gpu_run_state(s);
   free_gpu_weights(gw, w);
   close_model(mf);
   return 0;
