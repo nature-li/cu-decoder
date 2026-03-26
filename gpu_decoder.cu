@@ -430,6 +430,101 @@ __global__ void residual_kernel(float* x, const float* delta, int dim) {
   }
 }
 
+void forward_gpu(const Config& config, const GPUWeights& gw, GPURunState& s,
+                 int token, int pos) {
+  int dim = config.dim;
+  int head_dim = config.dim / config.n_heads;
+  int kv_dim = config.n_kv_heads * head_dim;
+  int kv_mul = config.n_heads / config.n_kv_heads;
+  int vocab_size = abs(config.vocab_size);
+  int threads = 256;
+
+  // 1. Embedding lookup
+  {
+    int blocks = (dim + threads - 1) / threads;
+    embedding_kernel<<<blocks, threads>>>(s.x, gw.token_embedding, token, dim);
+  }
+
+  for (int l = 0; l < config.n_layers; l++) {
+    // 2. Attention 前的 RMSNorm
+    rmsnorm_kernel<<<1, threads>>>(s.xb, s.x, gw.rms_att + l * dim, dim);
+
+    // 3. QKV 投影
+    {
+      matmul_kernel<<<(dim + threads - 1) / threads, threads>>>(
+          s.q, s.xb, gw.wq + l * dim * dim, dim, dim);
+      matmul_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
+          s.k, s.xb, gw.wk + l * kv_dim * dim, dim, kv_dim);
+      matmul_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
+          s.v, s.xb, gw.wv + l * kv_dim * dim, dim, kv_dim);
+    }
+
+    // 4. RoPE
+    {
+      int blocks = (dim / 2 + threads - 1) / threads;
+      rope_kernel<<<blocks, threads>>>(s.q, s.k, gw.freq_cis_real,
+                                       gw.freq_cis_imag, pos, dim, kv_dim,
+                                       head_dim);
+    }
+
+    // 5. KV Cache 写入
+    {
+      int blocks = (kv_dim + threads - 1) / threads;
+      kvcache_write_kernel<<<blocks, threads>>>(s.k_cache, s.v_cache, s.k, s.v,
+                                                l, pos, config.seq_len, kv_dim);
+    }
+
+    // 6. Attention
+    {
+      size_t shared_mem = config.seq_len * sizeof(float);
+      attention_kernel<<<config.n_heads, 256, shared_mem>>>(
+          s.q, s.k_cache + l * config.seq_len * kv_dim,
+          s.v_cache + l * config.seq_len * kv_dim, s.xb, pos, config.seq_len,
+          kv_dim, head_dim, kv_mul);
+    }
+
+    // 7. Attention 输出投影 + 残差连接
+    {
+      matmul_kernel<<<(dim + threads - 1) / threads, threads>>>(
+          s.xb2, s.xb, gw.wo + l * dim * dim, dim, dim);
+      residual_kernel<<<(dim + threads - 1) / threads, threads>>>(s.x, s.xb2,
+                                                                  dim);
+    }
+
+    // 8. FFN 前的 RMSNorm
+    rmsnorm_kernel<<<1, 256>>>(s.xb, s.x, gw.rms_ffn + l * dim, dim);
+
+    // 9. FFN: SwiGLU
+    {
+      matmul_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
+          s.hb, s.xb, gw.w1 + l * config.hidden_dim * dim, dim,
+          config.hidden_dim);
+      matmul_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
+          s.hb2, s.xb, gw.w3 + l * config.hidden_dim * dim, dim,
+          config.hidden_dim);
+      swiglu_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
+          s.hb, s.hb2, config.hidden_dim);
+    }
+
+    // 10. FFN 输出投影 + 残差连接
+    {
+      matmul_kernel<<<(dim + threads - 1) / threads, threads>>>(
+          s.xb2, s.hb, gw.w2 + l * dim * config.hidden_dim, config.hidden_dim,
+          dim);
+      residual_kernel<<<(dim + threads - 1) / threads, threads>>>(s.x, s.xb2,
+                                                                  dim);
+    }
+  }
+
+  // 11. 最终 RMSNorm
+  rmsnorm_kernel<<<1, threads>>>(s.xb, s.x, gw.rms_final, dim);
+
+  // 12.输出 logits，结果写到 pinned memory
+  {
+    matmul_kernel<<<(vocab_size + threads - 1) / threads, threads>>>(
+        s.logits, s.xb, gw.wcls, dim, vocab_size);
+  }
+}
 
 int main(int argc, char** argv) {
   if (argc < 2) {
