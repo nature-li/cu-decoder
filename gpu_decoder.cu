@@ -265,6 +265,47 @@ __global__ void matmul_kernel(float* out, const float* x, const float* w, int n,
   }
 }
 
+/**
+ * RoPE kernel
+ *
+ * 对 Q 和 K 做旋转位置编码
+ * 每两个元素一组做旋转: [x0, x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]
+ *
+ * Grid:  (dim/2 + 255) / 256 个 block
+ * Block: 256 个线程
+ * 线程 i: 负责处理第 i 对元素的旋转
+ * - Q 的第 i 对: q[2i], q[2i+1]
+ * - K 的第 i 对: k[2i], k[2i+1] (如果 2i < kv_dim)
+ */
+__global__ void rope_kernel(float* q, float* k, const float* freq_real,
+                            const float* freq_imag, int pos, int dim,
+                            int kv_dim, int head_dim) {
+  // 第 i 对
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  // 对应元素下标
+  int idx = i * 2;
+
+  if (idx < dim) {
+    int head_pos = idx % head_dim;
+    float cos_val = freq_real[pos * head_dim / 2 + head_pos / 2];
+    float sin_val = freq_imag[pos * head_dim / 2 + head_pos / 2];
+
+    float q0 = q[idx], q1 = q[idx + 1];
+    q[idx] = q0 * cos_val - q1 * sin_val;
+    q[idx + 1] = q0 * sin_val + q1 * cos_val;
+  }
+
+  if (idx < head_dim) {
+    int head_pos = idx % head_dim;
+    float cos_val = freq_real[pos * head_dim / 2 + head_pos / 2];
+    float sin_val = freq_imag[pos * head_dim / 2 + head_pos / 2];
+
+    float k0 = k[idx], k1 = k[idx + 1];
+    k[idx] = k0 * cos_val - k1 * sin_val;
+    k[idx + 1] = k0 * sin_val + k1 * cos_val;
+  }
+}
+
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
