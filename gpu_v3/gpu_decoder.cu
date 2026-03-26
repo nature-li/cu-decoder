@@ -56,19 +56,46 @@ __global__ void rmsnorm_kernel(float* out, const float* x, const float* weight,
 }
 
 /**
- * MatMul kernel: out = x @ w^T
- * Grid:  (d + 255) / 256 个 block
- * Block: 256 个线程
- * 线程 i: 计算 out[i] = x 和 w 第 i 行的点积
+ * 用 cublasSgemv 替换手写的 matmul_kernel
+ * 计算 out = x @ w^T
+ * w: [d, n] 行优先
+ * x: [n]
+ * out: [d]
+ *
+ * 行主序下
+ * out = x @ w^T = w @ x
+ *
+ * 代入 cublas 后的参数:
+ * A=w, op=CUBLAS_OP_T
+ * x=x
+ * m=n
+ * n=d
+ * lda=n
  */
-__global__ void matmul_kernel(float* out, const float* x, const float* w, int n,
-                              int d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < d) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) val += x[j] * w[i * n + j];
-    out[i] = val;
-  }
+void matmul_cublas(cublasHandle_t handle, float* out, float* x, const float* w,
+                   int n, int d) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  /**
+   * 计算公式:
+   * y = alpha * op(A) * x + beta * y
+   *
+   * 参数:
+   * - handle:  cuBLAS 句柄
+   * - trans:   是否对 A 做转置
+   * - m:       A 的行数
+   * - n:       A 的列数
+   * - alpha:   标量 alpha
+   * - A:       矩阵 A, shape: [m, n]
+   * - lda:     A 的 leading demension, 列优先下是行数
+   * - x:       输入向量 x
+   * - incx:    x 的元素间距, 1 表示连续
+   * - beta:    标量 beta
+   * - y:       输出向量 y
+   * - incy:    y 的元素间距, 1 表示连续
+   */
+  cublasSgemv(handle, CUBLAS_OP_T, n, d, &alpha, w, n, x, 1, &beta, out, 1);
 }
 
 /**
@@ -309,9 +336,12 @@ GPUDecoder::GPUDecoder(const std::string& model_file) {
   load_weights(w, config, data, mf);
   upload_weights(gw, w, config);
   alloc_gpu_run_state(gpu_state, config);
+
+  cublasCreate(&cublas_handle);
 }
 
 GPUDecoder::~GPUDecoder() {
+  cublasDestroy(cublas_handle);
   free_gpu_run_state(gpu_state);
   free_gpu_weights(gw, w);
   close_model(mf);
@@ -340,12 +370,12 @@ void GPUDecoder::forward(int token, int pos) {
                                    gw.rms_att + l * dim, dim);
 
     // 3. QKV 投影
-    matmul_kernel<<<(dim + threads - 1) / threads, threads>>>(
-        gpu_state.q, gpu_state.xb, gw.wq + l * dim * dim, dim, dim);
-    matmul_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
-        gpu_state.k, gpu_state.xb, gw.wk + l * kv_dim * dim, dim, kv_dim);
-    matmul_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
-        gpu_state.v, gpu_state.xb, gw.wv + l * kv_dim * dim, dim, kv_dim);
+    matmul_cublas(cublas_handle, gpu_state.q, gpu_state.xb,
+                  gw.wq + l * dim * dim, dim, dim);
+    matmul_cublas(cublas_handle, gpu_state.k, gpu_state.xb,
+                  gw.wk + l * kv_dim * dim, dim, kv_dim);
+    matmul_cublas(cublas_handle, gpu_state.v, gpu_state.xb,
+                  gw.wv + l * kv_dim * dim, dim, kv_dim);
 
     // 4. RoPE
     rope_kernel<<<(dim / 2 + threads - 1) / threads, threads>>>(
@@ -365,8 +395,8 @@ void GPUDecoder::forward(int token, int pos) {
         config.seq_len, kv_dim, head_dim, kv_mul);
 
     // 7. Attention 输出投影 + 残差
-    matmul_kernel<<<(dim + threads - 1) / threads, threads>>>(
-        gpu_state.xb2, gpu_state.xb, gw.wo + l * dim * dim, dim, dim);
+    matmul_cublas(cublas_handle, gpu_state.xb2, gpu_state.xb,
+                  gw.wo + l * dim * dim, dim, dim);
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(
         gpu_state.x, gpu_state.xb2, dim);
 
@@ -375,19 +405,16 @@ void GPUDecoder::forward(int token, int pos) {
                                    gw.rms_ffn + l * dim, dim);
 
     // 9. SwiGLU FFN
-    matmul_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
-        gpu_state.hb, gpu_state.xb, gw.w1 + l * config.hidden_dim * dim, dim,
-        config.hidden_dim);
-    matmul_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
-        gpu_state.hb2, gpu_state.xb, gw.w3 + l * config.hidden_dim * dim, dim,
-        config.hidden_dim);
+    matmul_cublas(cublas_handle, gpu_state.hb, gpu_state.xb,
+                  gw.w1 + l * config.hidden_dim * dim, dim, config.hidden_dim);
+    matmul_cublas(cublas_handle, gpu_state.hb2, gpu_state.xb,
+                  gw.w3 + l * config.hidden_dim * dim, dim, config.hidden_dim);
     swiglu_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
         gpu_state.hb, gpu_state.hb2, config.hidden_dim);
 
     // 10. FFN 输出投影 + 残差
-    matmul_kernel<<<(dim + threads - 1) / threads, threads>>>(
-        gpu_state.xb2, gpu_state.hb, gw.w2 + l * dim * config.hidden_dim,
-        config.hidden_dim, dim);
+    matmul_cublas(cublas_handle, gpu_state.xb2, gpu_state.hb,
+                  gw.w2 + l * dim * config.hidden_dim, config.hidden_dim, dim);
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(
         gpu_state.x, gpu_state.xb2, dim);
   }
@@ -396,8 +423,8 @@ void GPUDecoder::forward(int token, int pos) {
   rmsnorm_kernel<<<1, threads>>>(gpu_state.xb, gpu_state.x, gw.rms_final, dim);
 
   // 12. 输出 logits 到 pinned memory
-  matmul_kernel<<<(vocab_size + threads - 1) / threads, threads>>>(
-      gpu_state.logits, gpu_state.xb, gw.wcls, dim, vocab_size);
+  matmul_cublas(cublas_handle, gpu_state.logits, gpu_state.xb, gw.wcls, dim,
+                vocab_size);
 }
 
 // ============================================================================

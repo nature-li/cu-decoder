@@ -1,4 +1,6 @@
 #pragma once
+#include <cublas_v2.h>
+
 #include "decoder.h"
 
 struct GPUWeights {
@@ -46,4 +48,5 @@ class GPUDecoder : public Decoder {
   Weights w;
   GPUWeights gw;
   GPURunState gpu_state;
+  cublasHandle_t cublas_handle;
 };
