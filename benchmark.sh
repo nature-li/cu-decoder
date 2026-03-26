@@ -20,3 +20,6 @@ echo $PROMPT | $BUILD_DIR/gpu_decoder_v2 $MODEL $TOKENIZER
 
 echo "=== GPU v3 (tiling) ==="
 echo $PROMPT | $BUILD_DIR/gpu_decoder_v3 $MODEL $TOKENIZER
+
+echo "=== GPU v4 (tiling) ==="
+echo $PROMPT | $BUILD_DIR/gpu_decoder_v4 $MODEL $TOKENIZER

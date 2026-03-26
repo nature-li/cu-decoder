@@ -34,25 +34,72 @@ __global__ void embedding_kernel(float* out, const float* table, int token,
 }
 
 /**
+ * warp 内归约求和
+ * 调用后 warp 内 lane 0 持有所有线程的 val 之和
+ */
+__device__ float warp_reduce_sum(float val) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    /**
+     * 让当前线程去获取排在它后面第 offset 个线程里的数据
+     * 返回值 = 线程(i + offset) 的 val
+     */
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+/**
  * RMSNorm kernel
+ *
+ * 每个 thread 负责跨步累加自己的平方和
+ * warp 内用 __shfl_down_sync 归约，无 atomicAdd
+ * 各 warp 结果写入 shared memory，再做最终归约
+ *
  * Grid:  1 个 block
- * Block: 256 个线程
- * 每个线程跨步累加平方和，atomicAdd 汇总，最后归一化
+ * Block: 256 个线程（8 个 warp）
+ * 每个 thread: 跨步累加 x[tid], x[tid+256], x[tid+512]... 的平方
  */
 __global__ void rmsnorm_kernel(float* out, const float* x, const float* weight,
                                int dim) {
-  __shared__ float shared_sum;
-  if (threadIdx.x == 0) shared_sum = 0.0f;
-  __syncthreads();
+  // 8 个 warp，每个 warp 的归约结果存在这里
+  __shared__ float warp_sums[8];
 
+  int tid = threadIdx.x;
+  int warp_id = tid / 32;  // 属于第几个 warp
+  int lane_id = tid % 32;  // 在 warp 内的位置
+
+  // 1. 每个线程跨步累加平方和
   float local_sum = 0.0f;
-  for (int i = threadIdx.x; i < dim; i += blockDim.x) local_sum += x[i] * x[i];
-  atomicAdd(&shared_sum, local_sum);
+  for (int i = tid; i < dim; i += blockDim.x) {
+    local_sum += x[i] * x[i];
+  }
+
+  // 2. warp 内归约
+  local_sum = warp_reduce_sum(local_sum);
+
+  // 3. 每个 warp 的 lane 0 把结果写入 shared memory
+  if (lane_id == 0) {
+    warp_sums[warp_id] = local_sum;
+  }
   __syncthreads();
 
-  float norm = rsqrtf(shared_sum / dim + 1e-6f);
-  for (int i = threadIdx.x; i < dim; i += blockDim.x)
+  // 4. 用第一个 warp 对 8 个 warp 结果做最终归约
+  if (warp_id == 0) {
+    float val = (lane_id < 8) ? warp_sums[lane_id] : 0.0f;
+    val = warp_reduce_sum(val);
+
+    // lane 0 写入最终结果
+    if (lane_id == 0) {
+      warp_sums[0] = val;
+    }
+  }
+  __syncthreads();
+
+  // 5. 归一化
+  float norm = rsqrtf(warp_sums[0] / dim + 1e-6f);
+  for (int i = tid; i < dim; i += blockDim.x) {
     out[i] = x[i] * norm * weight[i];
+  }
 }
 
 /**
