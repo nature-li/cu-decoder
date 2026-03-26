@@ -60,13 +60,40 @@ __global__ void rmsnorm_kernel(float* out, const float* x, const float* weight,
  * Grid:  (d + 255) / 256 个 block
  * Block: 256 个线程
  * 线程 i: 计算 out[i] = x 和 w 第 i 行的点积
+ *
+ * 每个 thread  负责一个元素
+ * 每个 block   负责 256 个元素
+ * 每个 grid    负责 d 个元素
+ *
+ * x 分 tile 加载到 shared memory，block 内 256 个线程共享
  */
+template <int TILE_SIZE = 32>
 __global__ void matmul_kernel(float* out, const float* x, const float* w, int n,
                               int d) {
+  __shared__ float x_shared[TILE_SIZE];
+
+  // 负责 out[i]
   int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int tid = threadIdx.x;
+
+  float val = 0.0f;
+  for (int tile = 0; tile < n; tile += TILE_SIZE) {
+    // 每个 block 内只用前 TILE_SIZE 个线程协作加载
+    if (tid < TILE_SIZE) {
+      int x_idx = tile + tid;
+      x_shared[tid] = x_idx < n ? x[x_idx] : 0.0f;
+    }
+    __syncthreads();
+
+    if (i < d) {
+      for (int j = 0; j < TILE_SIZE && (tile + j) < n; j++) {
+        val += x_shared[j] * w[i * n + tile + j];
+      }
+    }
+    __syncthreads();
+  }
+
   if (i < d) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) val += x[j] * w[i * n + j];
     out[i] = val;
   }
 }
