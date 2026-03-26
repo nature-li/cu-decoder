@@ -2,8 +2,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <random>
+#include <string>
 
 struct Config {
   int dim;         // 模型隐藏层维度
@@ -46,7 +46,7 @@ struct Tokenizer {
   float* vocab_scores;
 };
 
-int load_config(Config& config, std::string& model_file);
+int load_config(Config& config, const std::string& model_file);
 int open_model(const std::string& model_file, ModelFile& mf);
 void close_model(ModelFile& mf);
 int load_weights(Weights& w, const Config& config, float* data,

@@ -13,7 +13,7 @@
 #include <random>
 #include <string>
 
-int load_config(Config& config, std::string& model_file) {
+int load_config(Config& config, const std::string& model_file) {
   FILE* f = fopen(model_file.c_str(), "rb");
   if (!f) {
     fprintf(stderr, "failed to open: %s\n", model_file.c_str());

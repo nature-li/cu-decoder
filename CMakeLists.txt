@@ -33,5 +33,5 @@ endmacro()
 
 # add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
 # add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
-add_executable(cpu_decoder cpu_decoder.cpp common.cpp)
-add_cuda_target(gpu_decoder gpu_decoder.cu common.cpp)
+add_executable(cpu_decoder cpu_decoder.cpp decoder.cpp common.cpp)
+add_cuda_target(gpu_decoder gpu_decoder.cu decoder.cpp common.cpp)
