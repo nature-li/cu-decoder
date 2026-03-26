@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <random>
 
 struct Config {
   int dim;         // 模型隐藏层维度
@@ -44,3 +45,19 @@ struct Tokenizer {
   // BPE merge 优先级分数，vocab_scores[i] 对应第 i 个 token
   float* vocab_scores;
 };
+
+int load_config(Config& config, std::string& model_file);
+int open_model(const std::string& model_file, ModelFile& mf);
+void close_model(ModelFile& mf);
+int load_weights(Weights& w, const Config& config, float* data,
+                 const ModelFile& mf);
+int load_tokenizer(Tokenizer& t, const std::string& tokenizer_file,
+                   int vocab_size);
+void free_tokenizer(Tokenizer& t);
+const char* decode(Tokenizer& t, int prev_token, int token);
+int encode(Tokenizer& t, const std::string& text, int* tokens);
+int vocab_lookup(Tokenizer& t, const char* str);
+int argmax(const float* logits, int size);
+int sample(const float* logits, int size, float temperature, std::mt19937& rng);
+int sample_topk(const float* logits, int size, int k, float temperature,
+                std::mt19937& rng);

@@ -16,9 +16,9 @@ set(CMAKE_CUDA_ARCHITECTURES 100)
 
 find_package(CUDAToolkit REQUIRED)
 
-macro(add_cuda_target target source)
+macro(add_cuda_target target)
     # 添加可执行文件
-    add_executable(${target} ${source})
+    add_executable(${target} ${ARGN})
 
     # 链接库
     target_link_libraries(${target} PRIVATE CUDA::cudart cublas)
@@ -33,5 +33,5 @@ endmacro()
 
 # add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
 # add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
-add_executable(cpu_decoder cpu_decoder.cpp)
-add_cuda_target(gpu_decoder gpu_decoder.cu)
+add_executable(cpu_decoder cpu_decoder.cpp common.cpp)
+add_cuda_target(gpu_decoder gpu_decoder.cu common.cpp)
