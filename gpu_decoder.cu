@@ -396,6 +396,24 @@ __global__ void attention_kernel(const float* q, const float* k_cache,
   }
 }
 
+/**
+ * SwiGLU kernel
+ *
+ * FFN(x) = w2(SiLU(w1(x)) * w3(x))
+ * 这个 kernel 负责中间那步: hb[i] = SiLU(hb[i]) * hb2[i]
+ *
+ * Grid:  (hidden_dim + 255) / 256 个 block
+ * Block: 256 个线程
+ * 线程 i: hb[i] = silu(hb[i]) * hb2[i]
+ */
+__global__ void swiglu_kernel(float* hb, const float* hb2, int hidden_dim) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < hidden_dim) {
+    float x = hb[i];
+    hb[i] = x * (1.0f / (1.0f + expf(-x))) * hb2[i];
+  }
+}
+
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
