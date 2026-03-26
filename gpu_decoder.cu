@@ -414,6 +414,22 @@ __global__ void swiglu_kernel(float* hb, const float* hb2, int hidden_dim) {
   }
 }
 
+/**
+ * Residual add kernel
+ *
+ * x[i] += delta[i]
+ *
+ * Grid:  (dim + 255) / 256 个 block
+ * Block: 256 个线程
+ * 线程 i: x[i] += delta[i]
+ */
+__global__ void residual_kernel(float* x, const float* delta, int dim) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < dim) {
+    x[i] += delta[i];
+  }
+}
+
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
