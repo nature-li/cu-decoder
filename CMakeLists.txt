@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18) # 建议 3.18+ 以获得更好的 CUDA 支持
-project(MiniGptDecoder CUDA)        # 声明项目语言包含 CUDA
+project(MiniDecoder CXX CUDA)        # 声明项目语言包含 CUDA
 
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
@@ -33,5 +33,5 @@ endmacro()
 
 # add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
 # add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
-add_cuda_target(cpu_decoder cpu_decoder.cu)
+add_executable(cpu_decoder cpu_decoder.cpp)
 add_cuda_target(gpu_decoder gpu_decoder.cu)
