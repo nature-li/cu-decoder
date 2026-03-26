@@ -32,5 +32,6 @@ macro(add_cuda_target target source)
 endmacro()
 
 # add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
-add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
+# add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
 add_cuda_target(cpu_decoder cpu_decoder.cu)
+add_cuda_target(gpu_decoder gpu_decoder.cu)

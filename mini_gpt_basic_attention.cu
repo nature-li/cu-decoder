@@ -5,7 +5,15 @@
 #include <iostream>
 #include <vector>
 
-#include "comm.h"
+#define CHECK_CUDA(call)                                                \
+  {                                                                     \
+    const cudaError_t error = call;                                     \
+    if (error != cudaSuccess) {                                         \
+      printf("Error: %s:%d, ", __FILE__, __LINE__);                     \
+      printf("code:%d, reason:%s\n", error, cudaGetErrorString(error)); \
+      exit(1);                                                          \
+    }                                                                   \
+  }
 
 // 超参数
 const int B = 1;

@@ -13,6 +13,23 @@
 
 #include "common.h"
 
+struct GPUWeights {
+  float* token_embedding;
+  float* rms_att;
+  float* wq;
+  float* wk;
+  float* wv;
+  float* wo;
+  float* rms_ffn;
+  float* w1;
+  float* w2;
+  float* w3;
+  float* rms_final;
+  float* freq_cis_real;
+  float* freq_cis_imag;
+  float* wcls;
+};
+
 struct RunState {
   // [dim] 当前 token 的隐藏状态，每层 attention/FFN 都在这上边做 in-place 更新
   float* x;
@@ -90,6 +107,8 @@ int load_weights(Weights& w, const Config& config, float* data,
 
   return 0;
 }
+
+void upload_weights(GPUWeights& gw, const Weights& w, const Config& config) {}
 
 int open_model(const std::string& model_file, ModelFile& mf) {
   mf.fd = open(model_file.c_str(), O_RDONLY);
