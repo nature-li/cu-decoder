@@ -328,6 +328,74 @@ __global__ void kvcache_write_kernel(float* k_cache, float* v_cache,
   }
 }
 
+/**
+ * Attention kernel
+ *
+ * Grid:  n_heads 个 block，每个 block 负责一个 head
+ * Block: 256 个线程
+ * 每个 block:
+ * - 1. 计算当前 head 的 Q @ K^T -> scores
+ * - 2. softmax
+ * - 3. scores @ V -> 输出
+ *
+ * shared memory: [seq_len] 存 attention scores
+ */
+__global__ void attention_kernel(const float* q, const float* k_cache,
+                                 const float* v_cache, float* out, int pos,
+                                 int seq_len, int kv_dim, int head_dim,
+                                 int kv_mul) {
+  int h = blockIdx.x;  // 当前 head
+  int tid = threadIdx.x;
+  float scale = rsqrtf((float)head_dim);
+
+  extern __shared__ float scores[];  // seq_len
+
+  const float* q_head = q + h * head_dim;
+  const float* k_layer = k_cache;
+  const float* v_layer = v_cache;
+
+  // 1. Q @ K^T -> scores，跨步循环处理所有历史 token
+  for (int t = tid; t <= pos; t += blockDim.x) {
+    const float* k_head = k_layer + t * kv_dim + (h / kv_mul) * head_dim;
+    float score = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+      score += q_head[d] * k_head[d];
+    }
+    scores[t] = score * scale;
+  }
+  __syncthreads();
+
+  // 2. softmax，0 号线程串行做
+  if (tid == 0) {
+    float max_val = scores[0];
+    for (int t = 1; t <= pos; t++) {
+      max_val = fmaxf(max_val, scores[t]);
+    }
+
+    float sum = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+      scores[t] = expf(scores[t] - max_val);
+      sum += scores[t];
+    }
+
+    for (int t = 0; t <= pos; t++) {
+      scores[t] /= sum;
+    }
+  }
+  __syncthreads();
+
+  // 3. scores @ V -> 输出，跨步循环处理 head_dim
+  float* out_head = out + h * head_dim;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    float val = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+      const float* v_head = v_layer + t * kv_dim + (h / kv_mul) * head_dim;
+      val += scores[t] * v_head[d];
+    }
+    out_head[d] = val;
+  }
+}
+
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
