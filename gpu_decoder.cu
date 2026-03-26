@@ -306,6 +306,28 @@ __global__ void rope_kernel(float* q, float* k, const float* freq_real,
   }
 }
 
+/**
+ * KV Cache 写入 kernel
+ *
+ * 把当前 pos 的 K/V 写入对应层的 cache
+ *
+ * Grid:  (kv_dim + 255) / 256 个 block
+ * Block: 256 个线程
+ * 线程 i:
+ * - k_cache[layer * seq_len * kv_dim + pos * kv_dim + i] = k[i]
+ * - v_cache[layer * seq_len * kv_dim + pos * kv_dim + i] = v[i]
+ */
+__global__ void kvcache_write_kernel(float* k_cache, float* v_cache,
+                                     const float* k, const float* v, int layer,
+                                     int pos, int seq_len, int kv_dim) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < kv_dim) {
+    int offset = layer * seq_len * kv_dim + pos * kv_dim + i;
+    k_cache[offset] = k[i];
+    v_cache[offset] = v[i];
+  }
+}
+
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
