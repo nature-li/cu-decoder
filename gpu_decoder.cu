@@ -171,6 +171,77 @@ void free_gpu_run_state(GPURunState& s) {
   cudaFreeHost(s.logits);
 }
 
+/**
+ * Embedding lookup kernel
+ *
+ * 每个线程负责取出 embedding 表中第 token 行的一个元素
+ *
+ * Grid: (dim + 255) / 256 个 block
+ * Block: 256 个线程
+ * 线程 i: out[i] = table[token * dim + i]
+ *
+ * 例:
+ * dim=288, 启动 2 个 block, 共 512 个线程
+ * 线程 0~287 各取一个元素, 线程 288~511 越界直接返回
+ */
+__global__ void embedding_kernel(float* out, const float* table, int token,
+                                 int dim) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < dim) {
+    out[i] = table[token * dim + i];
+  }
+}
+
+/**
+ * RMSNorm kernel
+ *
+ * 公式:
+ * rms(x) = sqrt(mean(x^2) + 1e-6)
+ * out[i] = x[i] / rms(x) * weight[i]
+ *
+ *
+ * Grid: 1 个 block (因为需要对整个 dim 做全局归约求和)
+ * Block: 256 个线程
+ * 每个线程负责: 跨步累加自己负责的元素的平方和，最后参与归一化
+ *
+ * 例:
+ * dim=288, 256 个线程
+ * 线程 0:   处理 x[0], x[256]        (跨步 256)
+ * 线程 1:   处理 x[1], x[257]
+ * ...
+ * 线程 31:  处理 x[31], x[287]
+ * 线程 32~255: 只处理 x[32]~x[255]   (第二步越界)
+ *
+ * 归约方式: 每个线程算局部平方和，atomicAdd 到 shared memory 汇总
+ */
+
+__global__ void rmsnorm_kernel(float* out, const float* x, const float* weight,
+                               int dim) {
+  __shared__ float shared_sum;
+  if (threadIdx.x == 0) {
+    shared_sum = 0.0f;
+  }
+  __syncthreads();
+
+  // 1. 每个线程计算自己负责元素的平方和
+  float local_sum = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    local_sum += x[i] * x[i];
+  }
+
+  // 2. 原子加到 shared memory 汇总
+  atomicAdd(&shared_sum, local_sum);
+  __syncthreads();
+
+  // 3. 计算归一化因子
+  float norm = rsqrtf(shared_sum / dim + 1e-6f);
+
+  // 4. 每个线程归一化自己负责的元素
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    out[i] = x[i] * norm * weight[i];
+  }
+}
+
 int alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = (config.dim / config.n_heads) * config.n_kv_heads;
