@@ -23,6 +23,8 @@ macro(add_cuda_target target)
     # 链接库
     target_link_libraries(${target} PRIVATE CUDA::cudart cublas)
 
+    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR})
+
     # 统一输出路径到 build 根目录
     set_target_properties(${target} PROPERTIES 
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -34,4 +36,5 @@ endmacro()
 # add_cuda_target(mini_gpt_basic_attention mini_gpt_basic_attention.cu)
 # add_cuda_target(mini_gpt_decoder mini_gpt_decoder.cu)
 add_executable(cpu_decoder cpu_decoder.cpp decoder.cpp common.cpp)
-add_cuda_target(gpu_decoder gpu_decoder.cu decoder.cpp common.cpp)
+add_cuda_target(gpu_decoder_v1 gpu_v1/gpu_decoder.cu decoder.cpp common.cpp)
+add_cuda_target(gpu_decoder_v2 gpu_v2/gpu_decoder.cu decoder.cpp common.cpp)
