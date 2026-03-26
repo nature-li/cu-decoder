@@ -19,3 +19,9 @@ ncu-ui profile_matmul_v1.ncu-rep
 sudo nsys profile --stats=true -o profile_v3_110m \
     ./gpu_decoder_v3 ../stories110M.bin ../tokenizer.bin <<< "Once upon a time"
 nsys-ui profile_v3_110m.nsys-rep
+
+
+## 3.整体分析v4
+sudo nsys profile --stats=true -o profile_v4_110m \
+    ./gpu_decoder_v4 ../stories110M.bin ../tokenizer.bin <<< "Once upon a time"
+nsys-ui profile_v4_110m.nsys-rep
