@@ -5,7 +5,7 @@
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 BUILD_DIR=$SCRIPT_DIR/build
 
-MODEL=$SCRIPT_DIR/stories15M.bin
+MODEL=$SCRIPT_DIR/stories110M.bin
 TOKENIZER=$SCRIPT_DIR/tokenizer.bin
 PROMPT="Once upon a time"
 
@@ -17,3 +17,6 @@ echo $PROMPT | $BUILD_DIR/gpu_decoder_v1 $MODEL $TOKENIZER
 
 echo "=== GPU v2 (tiling) ==="
 echo $PROMPT | $BUILD_DIR/gpu_decoder_v2 $MODEL $TOKENIZER
+
+echo "=== GPU v3 (tiling) ==="
+echo $PROMPT | $BUILD_DIR/gpu_decoder_v3 $MODEL $TOKENIZER
