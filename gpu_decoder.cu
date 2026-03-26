@@ -527,57 +527,94 @@ void forward_gpu(const Config& config, const GPUWeights& gw, GPURunState& s,
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
-    fprintf(stderr, "Usage: %s <model_file>\n", argv[0]);
+  if (argc < 3) {
+    fprintf(stderr, "Usage: %s <model_file> <tokenizer_file>\n", argv[0]);
     return 1;
   }
   std::string model_file = argv[1];
+  std::string tokenizer_file = argv[2];
+
+  // 加载 config
+  Config config;
+  if (load_config(config, model_file) != 0) return 1;
+  printf("dim        = %d\n", config.dim);
+  printf("hidden_dim = %d\n", config.hidden_dim);
+  printf("n_layers   = %d\n", config.n_layers);
+  printf("n_heads    = %d\n", config.n_heads);
+  printf("n_kv_heads = %d\n", config.n_kv_heads);
+  printf("vocab_size = %d\n", config.vocab_size);
+  printf("seq_len    = %d\n", config.seq_len);
 
   // 加载 CPU 权重
-  Config config;
-  load_config(config, model_file);
-
   ModelFile mf;
-  open_model(model_file, mf);
-
+  if (open_model(model_file, mf) != 0) return 1;
   float* data = (float*)((char*)mf.data + sizeof(Config));
   Weights w;
   load_weights(w, config, data, mf);
 
-  // 上传到 GPU
+  // 上传权重到 GPU
   GPUWeights gw;
   upload_weights(gw, w, config);
+  close_model(mf);  // CPU 权重上传完就可以释放了
 
-  // 读回来对比
-  float cpu_val, gpu_val;
+  // 加载 tokenizer
+  Tokenizer tokenizer;
+  if (load_tokenizer(tokenizer, tokenizer_file, abs(config.vocab_size)) != 0)
+    return 1;
+  printf("vocab[1] = %s\n", tokenizer.vocab[1]);
+  printf("vocab[2] = %s\n", tokenizer.vocab[2]);
 
-  // 验证 token_embedding[0]
-  cpu_val = w.token_embedding[0];
-  CHECK_CUDA(cudaMemcpy(&gpu_val, gw.token_embedding, sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  printf("token_embedding[0]: cpu=%f gpu=%f match=%d\n", cpu_val, gpu_val,
-         cpu_val == gpu_val);
+  // 分配 GPU RunState
+  GPURunState gpu_state;
+  alloc_gpu_run_state(gpu_state, config);
 
-  // 验证 rms_final[0]
-  cpu_val = w.rms_final[0];
-  CHECK_CUDA(cudaMemcpy(&gpu_val, gw.rms_final, sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  printf("rms_final[0]:       cpu=%f gpu=%f match=%d\n", cpu_val, gpu_val,
-         cpu_val == gpu_val);
+  int vocab_size = abs(config.vocab_size);
+  int steps = config.seq_len;
+  std::mt19937 rng(time(nullptr));
+  float temperature = 0.8f;
+  int top_k = 40;
 
-  // 验证 wq 最后一个元素
-  int wq_size = config.n_layers * config.dim * config.dim;
-  cpu_val = w.wq[wq_size - 1];
-  CHECK_CUDA(cudaMemcpy(&gpu_val, gw.wq + wq_size - 1, sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  printf("wq[last]:           cpu=%f gpu=%f match=%d\n", cpu_val, gpu_val,
-         cpu_val == gpu_val);
+  // 读用户输入
+  std::string prompt;
+  printf("Enter prompt: ");
+  std::getline(std::cin, prompt);
 
-  GPURunState s;
-  alloc_gpu_run_state(s, config);
+  // encode prompt -> token ids
+  std::vector<int> prompt_tokens(prompt.size() + 10);
+  int n_prompt = encode(tokenizer, prompt, prompt_tokens.data());
 
-  free_gpu_run_state(s);
+  // prefill
+  int token = 1;  // BOS
+  int pos = 0;
+  forward_gpu(config, gw, gpu_state, token, pos++);  // 先跑 BOS
+
+  for (int i = 0; i < n_prompt; i++) {
+    if (pos >= config.seq_len) {
+      fprintf(stderr, "prompt too long, max %d tokens\n", config.seq_len - 1);
+      return 1;
+    }
+    token = prompt_tokens[i];
+    forward_gpu(config, gw, gpu_state, token, pos++);
+  }
+
+  // 生成阶段
+  for (; pos < steps; pos++) {
+    cudaDeviceSynchronize();  // 等 GPU 跑完再采样
+
+    int next_token =
+        sample_topk(gpu_state.logits, vocab_size, top_k, temperature, rng);
+    if (next_token == 1 || next_token == 2) break;
+
+    printf("%s", decode(tokenizer, token, next_token));
+    fflush(stdout);
+
+    token = next_token;
+    forward_gpu(config, gw, gpu_state, token, pos);
+  }
+  printf("\n");
+
+  free_gpu_run_state(gpu_state);
   free_gpu_weights(gw, w);
-  close_model(mf);
+  free_tokenizer(tokenizer);
   return 0;
 }
